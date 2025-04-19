@@ -1,6 +1,7 @@
 # src/image_loader.py
 
 import os
+import warnings
 from PIL import Image
 import exifread
 from typing import Dict, Any, List, Optional, Tuple
@@ -29,7 +30,7 @@ class ImageLoader:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Image file not found: {path}")
         
-        extension = path.split('.')[-1].lower()
+        extension = os.path.splitext(path)[1][1:].lower()
         
         if not ImageFormats.is_supported_format(extension):
             raise ValueError(f"Unsupported file format: {extension}")
@@ -39,8 +40,11 @@ class ImageLoader:
             # RAW file handling
             try:
                 import rawpy
-                with rawpy.imread(path) as raw:
-                    image_data = raw.postprocess()
+                # Suppress libraw warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    with rawpy.imread(path) as raw:
+                        image_data = raw.postprocess()
             except ImportError:
                 raise ImportError("rawpy is required for RAW file support. Please install it with: pip install rawpy")
             except Exception as e:
@@ -79,11 +83,14 @@ class ImageLoader:
         for filename in os.listdir(directory):
             file_path = os.path.join(directory, filename)
             if os.path.isfile(file_path):
-                extension = filename.split('.')[-1].lower()
+                extension = os.path.splitext(filename)[1][1:].lower()
                 if ImageFormats.is_supported_format(extension):
                     try:
-                        image_data, metadata = self.load_from_path(file_path)
-                        results.append((file_path, image_data, metadata))
+                        # Suppress warnings during loading
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            image_data, metadata = self.load_from_path(file_path)
+                            results.append((file_path, image_data, metadata))
                     except Exception as e:
                         print(f"Error loading {file_path}: {e}")
         
@@ -99,7 +106,7 @@ class ImageLoader:
         Returns:
             Dictionary of metadata
         """
-        extension = path.split('.')[-1].lower()
+        extension = os.path.splitext(path)[1][1:].lower()
         
         metadata = {
             'filename': os.path.basename(path),
@@ -143,6 +150,12 @@ class ImageLoader:
                 
                 if 'Image Make' in exif_tags:
                     metadata['camera_make'] = str(exif_tags['Image Make'])
+                
+                # Check for orientation
+                if 'Image Orientation' in exif_tags:
+                    orientation_tag = exif_tags['Image Orientation']
+                    if hasattr(orientation_tag, 'values') and len(orientation_tag.values) > 0:
+                        metadata['orientation'] = orientation_tag.values[0]
         
         except Exception as e:
             metadata['exif_error'] = str(e)
