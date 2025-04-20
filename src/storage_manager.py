@@ -358,12 +358,8 @@ class StorageManager:
         
         return result
     
-    def _export_image(self,
-                    image_id: str,
-                    dest_path: str,
-                    export_format: ExportFormat,
-                    jpeg_quality: int = 95,
-                    tiff_compression: Optional[str] = None) -> bool:
+    def _export_image(self, image_id: str, dest_path: str, export_format: ExportFormat, 
+                     jpeg_quality: int = 95, tiff_compression: Optional[str] = None) -> bool:
         """
         Export an image to the destination path.
         
@@ -383,23 +379,59 @@ class StorageManager:
                 shutil.copy2(image_id, dest_path)
                 return True
             
-            # Otherwise, convert using PIL
-            with Image.open(image_id) as img:
-                if export_format == ExportFormat.JPEG:
-                    img.save(dest_path, format="JPEG", quality=jpeg_quality)
-                elif export_format == ExportFormat.TIFF:
-                    compression = tiff_compression if tiff_compression else None
-                    img.save(dest_path, format="TIFF", compression=compression)
-                elif export_format == ExportFormat.PNG:
-                    img.save(dest_path, format="PNG")
-                else:
-                    # Fallback to copy
-                    shutil.copy2(image_id, dest_path)
-                
-                return True
-                
+            # Get file extension to determine processing method
+            extension = os.path.splitext(image_id)[1].lower().strip('.')
+            
+            # Check if it's a RAW file
+            from .image_formats import ImageFormats
+            is_raw = ImageFormats.is_raw_format(extension)
+            
+            if is_raw:
+                # Use rawpy for RAW files
+                try:
+                    import rawpy
+                    import numpy as np
+                    
+                    # Process RAW file using rawpy
+                    with rawpy.imread(image_id) as raw:
+                        rgb = raw.postprocess()
+                    
+                    # Convert to PIL image for saving
+                    from PIL import Image
+                    img = Image.fromarray(rgb)
+                    
+                    # Save in requested format
+                    if export_format == ExportFormat.JPEG:
+                        img.save(dest_path, format="JPEG", quality=jpeg_quality)
+                    elif export_format == ExportFormat.TIFF:
+                        compression = tiff_compression if tiff_compression else None
+                        img.save(dest_path, format="TIFF", compression=compression)
+                    elif export_format == ExportFormat.PNG:
+                        img.save(dest_path, format="PNG")
+                    
+                    return True
+                    
+                except ImportError:
+                    self.logger.error("rawpy is required for RAW file conversion. Please install it with: pip install rawpy")
+                    return False
+                except Exception as e:
+                    self.logger.error(f"Error processing RAW file {image_id}: {e}")
+                    return False
+            else:
+                # For non-RAW formats, use PIL directly
+                with Image.open(image_id) as img:
+                    if export_format == ExportFormat.JPEG:
+                        img.save(dest_path, format="JPEG", quality=jpeg_quality)
+                    elif export_format == ExportFormat.TIFF:
+                        compression = tiff_compression if tiff_compression else None
+                        img.save(dest_path, format="TIFF", compression=compression)
+                    elif export_format == ExportFormat.PNG:
+                        img.save(dest_path, format="PNG")
+                    
+                    return True
+                    
         except Exception as e:
-            self.logger.error(f"Error exporting {image_id} to {dest_path}: {str(e)}")
+            self.logger.error(f"Error exporting {image_id} to {dest_path}: {e}")
             return False
     
     def _export_xmp_sidecar(self, image_info: Dict[str, Any], xmp_path: str) -> bool:
@@ -467,7 +499,7 @@ class StorageManager:
             return True
             
         except Exception as e:
-            self.logger.error(f"Error exporting XMP sidecar to {xmp_path}: {str(e)}")
+            self.logger.error(f"Error exporting XMP sidecar to {xmp_path}: {e}")
             return False
     
     def export_as_catalog(self, 
@@ -604,7 +636,7 @@ class StorageManager:
                     progress.update(1)
                     
                 except Exception as e:
-                    self.logger.error(f"Error organizing {image_path}: {str(e)}")
+                    self.logger.error(f"Error organizing {image_path}: {e}")
                     stats["errors"] += 1
                     progress.update(1)
         
@@ -705,7 +737,7 @@ class StorageManager:
             return stats
             
         except Exception as e:
-            self.logger.error(f"Error exporting metadata: {str(e)}")
+            self.logger.error(f"Error exporting metadata: {e}")
             return {"total": len(selected_images), "exported": 0, "error": str(e)}
     
     def _is_image_file(self, filename: str) -> bool:
