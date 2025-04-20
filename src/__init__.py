@@ -10,6 +10,9 @@ __version__ = '0.1.0'
 from .image_loader import ImageLoader
 from .analysis_engine import AnalysisEngine, ImageAnalysisResult
 from .rating_system import RatingSystem, RatingProfile, ImageRating, RatingCategory, UserPreferenceModel
+from .selection_manager import SelectionManager, SelectionStatus, ColorLabel
+from .plugin_system import PluginManager, CupcakePlugin, PluginType, PluginHook
+from .error_suppressor import ErrorSuppressor
 
 # We'll uncomment these as we implement them
 # from .selection_manager import SelectionManager
@@ -26,6 +29,18 @@ __all__ = [
     'ImageRating',
     'RatingCategory',
     'UserPreferenceModel',
+    'SelectionManager',
+    'SelectionStatus',
+    'ColorLabel',
+    'StorageManager',
+    'ExportFormat', 
+    'NamingPattern',
+    'FolderStructure',
+    'PluginManager',
+    'CupcakePlugin',
+    'PluginType',
+    'PluginHook',
+    'ErrorSuppressor',
     # 'SelectionManager',
     # 'StorageManager',
     # 'PluginManager',

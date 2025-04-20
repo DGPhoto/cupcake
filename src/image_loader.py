@@ -1,12 +1,33 @@
 # src/image_loader.py
 
 import os
-import warnings
 from PIL import Image
 import exifread
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 from .image_formats import ImageFormats
+
+# Import the error suppressor
+try:
+    from .error_suppressor import ErrorSuppressor
+except ImportError:
+    # Create a fallback implementation if module is not found
+    class ErrorSuppressor:
+        @staticmethod
+        def suppress_stderr():
+            import contextlib
+            import io
+            @contextlib.contextmanager
+            def _suppress_stderr():
+                stderr = io.StringIO()
+                import sys
+                old_stderr = sys.stderr
+                sys.stderr = stderr
+                try:
+                    yield
+                finally:
+                    sys.stderr = old_stderr
+            return _suppress_stderr()
 
 class ImageLoader:
     """Handles loading images from various sources and extracting metadata."""
@@ -30,7 +51,7 @@ class ImageLoader:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Image file not found: {path}")
         
-        extension = os.path.splitext(path)[1][1:].lower()
+        extension = path.split('.')[-1].lower()
         
         if not ImageFormats.is_supported_format(extension):
             raise ValueError(f"Unsupported file format: {extension}")
@@ -40,9 +61,8 @@ class ImageLoader:
             # RAW file handling
             try:
                 import rawpy
-                # Suppress libraw warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
+                # Use error suppressor to hide libraw error messages
+                with ErrorSuppressor.suppress_stderr():
                     with rawpy.imread(path) as raw:
                         image_data = raw.postprocess()
             except ImportError:
@@ -83,14 +103,12 @@ class ImageLoader:
         for filename in os.listdir(directory):
             file_path = os.path.join(directory, filename)
             if os.path.isfile(file_path):
-                extension = os.path.splitext(filename)[1][1:].lower()
+                extension = filename.split('.')[-1].lower()
                 if ImageFormats.is_supported_format(extension):
                     try:
-                        # Suppress warnings during loading
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore")
+                        with ErrorSuppressor.suppress_stderr():
                             image_data, metadata = self.load_from_path(file_path)
-                            results.append((file_path, image_data, metadata))
+                        results.append((file_path, image_data, metadata))
                     except Exception as e:
                         print(f"Error loading {file_path}: {e}")
         
@@ -106,7 +124,7 @@ class ImageLoader:
         Returns:
             Dictionary of metadata
         """
-        extension = os.path.splitext(path)[1][1:].lower()
+        extension = path.split('.')[-1].lower()
         
         metadata = {
             'filename': os.path.basename(path),
@@ -124,41 +142,48 @@ class ImageLoader:
         # Extract EXIF data
         try:
             with open(path, 'rb') as f:
-                exif_tags = exifread.process_file(f)
-                
-                # Process common EXIF tags
-                if 'EXIF DateTimeOriginal' in exif_tags:
-                    metadata['datetime'] = str(exif_tags['EXIF DateTimeOriginal'])
-                
-                if 'EXIF FocalLength' in exif_tags:
-                    metadata['focal_length'] = self._extract_rational(exif_tags['EXIF FocalLength'])
-                
-                if 'EXIF ExposureTime' in exif_tags:
-                    metadata['exposure_time'] = self._extract_rational(exif_tags['EXIF ExposureTime'])
-                
-                if 'EXIF FNumber' in exif_tags:
-                    metadata['f_number'] = self._extract_rational(exif_tags['EXIF FNumber'])
-                
-                if 'EXIF ISOSpeedRatings' in exif_tags:
-                    metadata['iso'] = str(exif_tags['EXIF ISOSpeedRatings'])
-                
-                if 'EXIF LensModel' in exif_tags:
-                    metadata['lens_model'] = str(exif_tags['EXIF LensModel'])
-                
-                if 'Image Model' in exif_tags:
-                    metadata['camera_model'] = str(exif_tags['Image Model'])
-                
-                if 'Image Make' in exif_tags:
-                    metadata['camera_make'] = str(exif_tags['Image Make'])
-                
-                # Check for orientation
-                if 'Image Orientation' in exif_tags:
-                    orientation_tag = exif_tags['Image Orientation']
-                    if hasattr(orientation_tag, 'values') and len(orientation_tag.values) > 0:
-                        metadata['orientation'] = orientation_tag.values[0]
+                try:
+                    with ErrorSuppressor.suppress_stderr():
+                        exif_tags = exifread.process_file(f)
+                        
+                        # Process common EXIF tags
+                        if 'EXIF DateTimeOriginal' in exif_tags:
+                            metadata['datetime'] = str(exif_tags['EXIF DateTimeOriginal'])
+                        
+                        if 'EXIF FocalLength' in exif_tags:
+                            metadata['focal_length'] = self._extract_rational(exif_tags['EXIF FocalLength'])
+                        
+                        if 'EXIF ExposureTime' in exif_tags:
+                            metadata['exposure_time'] = self._extract_rational(exif_tags['EXIF ExposureTime'])
+                        
+                        if 'EXIF FNumber' in exif_tags:
+                            metadata['f_number'] = self._extract_rational(exif_tags['EXIF FNumber'])
+                        
+                        if 'EXIF ISOSpeedRatings' in exif_tags:
+                            metadata['iso'] = str(exif_tags['EXIF ISOSpeedRatings'])
+                        
+                        if 'EXIF LensModel' in exif_tags:
+                            metadata['lens_model'] = str(exif_tags['EXIF LensModel'])
+                        
+                        if 'Image Model' in exif_tags:
+                            metadata['camera_model'] = str(exif_tags['Image Model'])
+                        
+                        if 'Image Make' in exif_tags:
+                            metadata['camera_make'] = str(exif_tags['Image Make'])
+                except Exception as e:
+                    metadata['exif_error'] = str(e)
         
         except Exception as e:
             metadata['exif_error'] = str(e)
+        
+        # Set today's date if no datetime in metadata (fallback for organization)
+        if 'datetime' not in metadata:
+            import datetime
+            metadata['datetime'] = datetime.datetime.now().strftime("%Y:%m:%d %H:%M:%S")
+        
+        # Try to get more metadata from RAW files if available
+        if metadata['is_raw'] and not metadata.get('camera_make') and not metadata.get('camera_model'):
+            self._extract_raw_metadata(path, metadata)
         
         return metadata
     
@@ -168,6 +193,30 @@ class ImageLoader:
             return float(tag.values[0].num) / float(tag.values[0].den)
         except (AttributeError, ZeroDivisionError):
             return 0.0
+    
+    def _extract_raw_metadata(self, path: str, metadata: Dict[str, Any]) -> None:
+        """
+        Try to extract additional metadata from RAW files.
+        
+        Args:
+            path: Path to the RAW file
+            metadata: Metadata dictionary to update
+        """
+        try:
+            import rawpy
+            with ErrorSuppressor.suppress_stderr():
+                with rawpy.imread(path) as raw:
+                    if hasattr(raw, 'raw_type') and raw.raw_type:
+                        metadata['raw_type'] = str(raw.raw_type)
+                    
+                    if hasattr(raw, 'camera_maker') and raw.camera_maker:
+                        metadata['camera_make'] = raw.camera_maker
+                    
+                    if hasattr(raw, 'camera_model') and raw.camera_model:
+                        metadata['camera_model'] = raw.camera_model
+        except (ImportError, Exception):
+            # Just skip if rawpy is not available or errors occur
+            pass
     
     def clear_cache(self):
         """Clear the image cache to free memory."""
