@@ -68,7 +68,8 @@ class StorageManager:
                       jpeg_quality: int = 95,
                       tiff_compression: Optional[str] = None,
                       include_xmp: bool = True,
-                      overwrite: bool = False) -> Dict[str, Any]:
+                      overwrite: bool = False,
+                      progress_callback: Optional[Callable[[int, int], None]] = None) -> Dict[str, Any]:
         """
         Export selected images according to specified parameters.
         
@@ -84,6 +85,7 @@ class StorageManager:
             tiff_compression: TIFF compression type if export_format is TIFF
             include_xmp: Whether to include XMP sidecars for metadata
             overwrite: Whether to overwrite existing files
+            progress_callback: Optional callback function to report progress (current, total)
             
         Returns:
             Dictionary with export statistics
@@ -112,66 +114,63 @@ class StorageManager:
             "output_dir": output_dir
         }
         
-        # Create progress bar
-        with tqdm(total=len(selected_images), desc="Exporting images") as progress:
-            # Process each selected image
-            for image_id in selected_images:
-                try:
-                    # Get image info
-                    image_info = selection_manager.get_image_info(image_id)
-                    if not image_info:
-                        self.logger.warning(f"Image not found: {image_id}")
-                        stats["errors"] += 1
-                        progress.update(1)
-                        continue
-                    
-                    # Determine destination path
-                    dest_path = self._get_destination_path(
-                        image_id,
-                        image_info,
-                        output_dir,
-                        naming_pattern,
-                        folder_structure,
-                        export_format,
-                        custom_name_pattern,
-                        custom_folder_pattern
-                    )
-                    
-                    # Create destination directory if it doesn't exist
-                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                    
-                    # Check if destination file already exists
-                    if os.path.exists(dest_path) and not overwrite:
-                        self.logger.info(f"File already exists, skipping: {dest_path}")
-                        stats["skipped"] += 1
-                        progress.update(1)
-                        continue
-                    
-                    # Perform the export
-                    success = self._export_image(
-                        image_id,
-                        dest_path,
-                        export_format,
-                        jpeg_quality,
-                        tiff_compression
-                    )
-                    
-                    if success:
-                        stats["exported"] += 1
-                        
-                        # Export XMP sidecar if requested
-                        if include_xmp:
-                            xmp_path = os.path.splitext(dest_path)[0] + ".xmp"
-                            self._export_xmp_sidecar(image_info, xmp_path)
-                    else:
-                        stats["errors"] += 1
-                    
-                    progress.update(1)
-                    
-                except Exception as e:
-                    self.logger.error(f"Error exporting {image_id}: {str(e)}")
+        # Process each selected image
+        for idx, image_id in enumerate(selected_images):
+            try:
+                # Get image info
+                image_info = selection_manager.get_image_info(image_id)
+                if not image_info:
+                    self.logger.warning(f"Image not found: {image_id}")
                     stats["errors"] += 1
-                    progress.update(1)
+                    continue
+                
+                # Determine destination path
+                dest_path = self._get_destination_path(
+                    image_id,
+                    image_info,
+                    output_dir,
+                    naming_pattern,
+                    folder_structure,
+                    export_format,
+                    custom_name_pattern,
+                    custom_folder_pattern
+                )
+                
+                # Create destination directory if it doesn't exist
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                
+                # Check if destination file already exists
+                if os.path.exists(dest_path) and not overwrite:
+                    self.logger.info(f"File already exists, skipping: {dest_path}")
+                    stats["skipped"] += 1
+                    continue
+                
+                # Perform the export
+                success = self._export_image(
+                    image_id,
+                    dest_path,
+                    export_format,
+                    jpeg_quality,
+                    tiff_compression
+                )
+                
+                if success:
+                    stats["exported"] += 1
+                    
+                    # Export XMP sidecar if requested
+                    if include_xmp:
+                        xmp_path = os.path.splitext(dest_path)[0] + ".xmp"
+                        self._export_xmp_sidecar(image_info, xmp_path)
+                else:
+                    stats["errors"] += 1
+                
+                # Chiama il callback di progresso se presente
+                if progress_callback is not None:
+                    progress_callback(idx + 1, len(selected_images))
+                    
+            except Exception as e:
+                self.logger.error(f"Error exporting {image_id}: {str(e)}")
+                stats["errors"] += 1
         
         return stats
     

@@ -58,7 +58,8 @@ class UserSettings:
             "learning_enabled": True,
             "ui_theme": "light",
             "file_extensions_filter": [],
-            "last_directories": []
+            "last_directories": [],
+            "use_gpu": True  # Abilita GPU per default, verrà automaticamente disabilitata se non disponibile
         }
         
         # Load configuration

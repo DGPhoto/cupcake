@@ -4,6 +4,8 @@ import numpy as np
 import cv2
 from typing import Dict, Any, List, Tuple, Optional
 from dataclasses import dataclass, field
+import gc
+import logging
 
 @dataclass
 class ImageAnalysisResult:
@@ -48,6 +50,44 @@ class AnalysisEngine:
             config: Dictionary of configuration parameters
         """
         self.config = config or {}
+        self.logger = logging.getLogger("cupcake.analysis")
+        
+        # Flag per indicare se la GPU è disponibile e in uso
+        self.gpu_available = False
+        
+        # Verifica se utilizzare la GPU
+        self.use_gpu = self.config.get('use_gpu', False)
+        
+        if self.use_gpu:
+            try:
+                # Verifica se OpenCV può utilizzare CUDA
+                cv_build_info = cv2.getBuildInformation()
+                if 'CUDA' in cv_build_info and 'YES' in cv_build_info[cv_build_info.find('CUDA'):cv_build_info.find('\n', cv_build_info.find('CUDA'))]:
+                    self.logger.info("OpenCV con supporto CUDA disponibile. GPU abilitata.")
+                    # Imposta OpenCV per usare CUDA quando possibile
+                    cv2.setUseOptimized(True)
+                    self.gpu_available = True
+                else:
+                    self.logger.warning("OpenCV senza supporto CUDA. GPU richiesta ma non disponibile.")
+                    
+                # Verifica la disponibilità di librerie GPU aggiuntive
+                try:
+                    import tensorflow as tf
+                    gpus = tf.config.list_physical_devices('GPU')
+                    if gpus:
+                        self.logger.info(f"TensorFlow con supporto GPU disponibile. {len(gpus)} GPU trovate.")
+                        # Consenti crescita di memoria dinamica sulla GPU
+                        for gpu in gpus:
+                            tf.config.experimental.set_memory_growth(gpu, True)
+                        self.gpu_available = True
+                except ImportError:
+                    self.logger.debug("TensorFlow non installato, saltando il controllo GPU di TensorFlow.")
+                except Exception as e:
+                    self.logger.warning(f"Errore nel controllare le GPU TensorFlow: {e}")
+                    
+            except Exception as e:
+                self.logger.warning(f"Errore nell'inizializzazione GPU: {e}")
+                self.use_gpu = False
         
         # Initialize face detection with more reliable approach
         try:
@@ -62,7 +102,7 @@ class AnalysisEngine:
         except:
             self.face_cascade = None
             self.profile_cascade = None
-            print("Warning: Face detection not available. OpenCV haar cascades not found.")
+            self.logger.warning("Face detection not available. OpenCV haar cascades not found.")
     
     def analyze_image(self, image_data: np.ndarray, metadata: Dict[str, Any] = None) -> ImageAnalysisResult:
         """
@@ -76,6 +116,43 @@ class AnalysisEngine:
             ImageAnalysisResult object with analysis results
         """
         result = ImageAnalysisResult()
+        
+        # Ottimizzazione memoria: downsampling per immagini grandi
+        max_dimension = 2500  # Limita dimensione massima per l'analisi
+        original_shape = image_data.shape
+        
+        # Applica downsampling se necessario
+        if len(image_data.shape) >= 2 and (image_data.shape[0] > max_dimension or image_data.shape[1] > max_dimension):
+            # Calcola fattore di scala
+            scale_factor = max_dimension / max(image_data.shape[0], image_data.shape[1])
+            
+            # Calcola nuove dimensioni
+            new_height = int(image_data.shape[0] * scale_factor)
+            new_width = int(image_data.shape[1] * scale_factor)
+            
+            # Ridimensiona l'immagine
+            try:
+                # Usa la GPU se disponibile per il ridimensionamento
+                if self.use_gpu and self.gpu_available and hasattr(cv2, 'cuda'):
+                    gpu_img = cv2.cuda_GpuMat()
+                    gpu_img.upload(image_data)
+                    gpu_resized = cv2.cuda.resize(gpu_img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                    image_data = gpu_resized.download()
+                else:
+                    # Metodo CPU standard
+                    if len(image_data.shape) == 3 and image_data.shape[2] >= 3:
+                        self.logger.debug(f"Downsampling immagine da {image_data.shape} a ({new_height}, {new_width}, {image_data.shape[2]})")
+                        image_data = cv2.resize(image_data, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                    else:
+                        self.logger.debug(f"Downsampling immagine da {image_data.shape} a ({new_height}, {new_width})")
+                        image_data = cv2.resize(image_data, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            except Exception as e:
+                self.logger.warning(f"Errore nel ridimensionamento: {e}, usando l'immagine originale")
+        
+        # Converti a float32 se è float64 per risparmiare memoria
+        if hasattr(image_data, 'dtype') and image_data.dtype == np.float64:
+            self.logger.debug(f"Convertendo immagine da float64 a float32 per risparmiare memoria")
+            image_data = image_data.astype(np.float32)
         
         # Check if image needs to be rotated based on metadata
         if metadata and 'orientation' in metadata:
@@ -126,6 +203,12 @@ class AnalysisEngine:
         result.overall_composition_score = self._calculate_overall_composition(result)
         result.overall_score = self._calculate_overall_score_improved(result)
         
+        # Libera memoria esplicitamente alla fine dell'analisi
+        del grayscale
+        if lab_image is not None:
+            del lab_image
+        gc.collect()
+        
         return result
     
     def _correct_orientation(self, image_data: np.ndarray, orientation: int) -> np.ndarray:
@@ -162,20 +245,57 @@ class AnalysisEngine:
         Calculate image sharpness using an improved method that combines
         multiple approaches for more reliable results.
         """
-        # Method 1: Laplacian variance (edge detection)
-        laplacian = cv2.Laplacian(grayscale, cv2.CV_64F)
+        # Usa CUDA se disponibile
+        if self.use_gpu and self.gpu_available and hasattr(cv2, 'cuda'):
+            try:
+                # Carica l'immagine sulla GPU
+                gpu_grayscale = cv2.cuda_GpuMat()
+                gpu_grayscale.upload(grayscale)
+                
+                # Laplacian
+                gpu_laplacian = cv2.cuda.createLaplacianFilter(cv2.CV_64F, 1)
+                gpu_result = gpu_laplacian.apply(gpu_grayscale)
+                laplacian = gpu_result.download()
+                
+                # Sobel X e Y
+                gpu_sobelx = cv2.cuda.createSobelFilter(cv2.CV_64F, 1, 0)
+                gpu_sobely = cv2.cuda.createSobelFilter(cv2.CV_64F, 0, 1)
+                
+                gpu_result_x = gpu_sobelx.apply(gpu_grayscale)
+                gpu_result_y = gpu_sobely.apply(gpu_grayscale)
+                
+                sobelx = gpu_result_x.download()
+                sobely = gpu_result_y.download()
+                
+                # Blur per high-pass
+                gpu_blur = cv2.cuda.createGaussianFilter(cv2.CV_32F, cv2.CV_32F, (9, 9), 0)
+                gpu_grayscale_float = cv2.cuda_GpuMat()
+                gpu_grayscale_float.upload(grayscale.astype(np.float32))
+                
+                gpu_blur_result = gpu_blur.apply(gpu_grayscale_float)
+                blur = gpu_blur_result.download()
+                
+            except Exception as e:
+                self.logger.warning(f"Errore nell'elaborazione GPU per sharpness: {e}. Fallback a CPU.")
+                # Fallback a CPU
+                laplacian = cv2.Laplacian(grayscale, cv2.CV_64F)
+                sobelx = cv2.Sobel(grayscale, cv2.CV_64F, 1, 0, ksize=3)
+                sobely = cv2.Sobel(grayscale, cv2.CV_64F, 0, 1, ksize=3)
+                blur = cv2.GaussianBlur(grayscale.astype(np.float32), (9, 9), 0)
+        else:
+            # Metodo CPU standard
+            laplacian = cv2.Laplacian(grayscale, cv2.CV_64F)
+            sobelx = cv2.Sobel(grayscale, cv2.CV_64F, 1, 0, ksize=3)
+            sobely = cv2.Sobel(grayscale, cv2.CV_64F, 0, 1, ksize=3)
+            blur = cv2.GaussianBlur(grayscale.astype(np.float32), (9, 9), 0)
+        
+        # Calcoli standard indipendenti dall'uso di GPU/CPU
         lap_variance = np.var(laplacian)
         
-        # Method 2: Sobel gradients (detects edges in x and y directions)
-        sobelx = cv2.Sobel(grayscale, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(grayscale, cv2.CV_64F, 0, 1, ksize=3)
         sobel_magnitude = np.sqrt(sobelx**2 + sobely**2)
         sobel_score = np.mean(sobel_magnitude)
         
-        # Method 3: High-pass filter (removes low frequencies, keeps details)
-        # Create a simple high-pass filter using a Gaussian blur difference
-        blur = cv2.GaussianBlur(grayscale, (9, 9), 0)
-        high_pass = grayscale.astype(np.float32) - blur.astype(np.float32)
+        high_pass = grayscale.astype(np.float32) - blur
         high_pass_score = np.std(high_pass)
         
         # Normalize each score from 0-100
@@ -191,6 +311,9 @@ class AnalysisEngine:
         # Apply a more intuitive curve - severe penalties for very low sharpness,
         # but diminishing returns for very high sharpness
         adjusted_score = np.power(sharpness_score / 100, 0.7) * 100
+        
+        # Libera memoria
+        del laplacian, sobelx, sobely, sobel_magnitude, blur, high_pass
         
         return adjusted_score
     
@@ -283,6 +406,14 @@ class AnalysisEngine:
             exposure_score = (0.4 * mean_score + 
                              0.3 * std_score + 
                              0.3 * clipping_score)
+            
+            # Libera memoria
+            if 'gray' in locals() and gray is not image_data:
+                del gray
+        
+        # Libera memoria
+        if 'hist' in locals():
+            del hist
         
         return exposure_score
     
@@ -302,9 +433,30 @@ class AnalysisEngine:
         # Dynamic range as difference between percentiles
         dynamic_range = p98 - p2
         
-        # Calculate local contrast using Sobel operator
-        sobelx = cv2.Sobel(grayscale, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(grayscale, cv2.CV_64F, 0, 1, ksize=3)
+        # Calculate local contrast - tenta di usare la GPU se disponibile
+        if self.use_gpu and self.gpu_available and hasattr(cv2, 'cuda'):
+            try:
+                # Carica l'immagine sulla GPU
+                gpu_grayscale = cv2.cuda_GpuMat()
+                gpu_grayscale.upload(grayscale)
+                
+                # Sobel X e Y
+                gpu_sobelx = cv2.cuda.createSobelFilter(cv2.CV_64F, 1, 0)
+                gpu_sobely = cv2.cuda.createSobelFilter(cv2.CV_64F, 0, 1)
+                
+                gpu_result_x = gpu_sobelx.apply(gpu_grayscale)
+                gpu_result_y = gpu_sobely.apply(gpu_grayscale)
+                
+                sobelx = gpu_result_x.download()
+                sobely = gpu_result_y.download()
+            except Exception as e:
+                self.logger.warning(f"Errore nell'elaborazione GPU per contrast: {e}. Fallback a CPU.")
+                sobelx = cv2.Sobel(grayscale, cv2.CV_64F, 1, 0, ksize=3)
+                sobely = cv2.Sobel(grayscale, cv2.CV_64F, 0, 1, ksize=3)
+        else:
+            sobelx = cv2.Sobel(grayscale, cv2.CV_64F, 1, 0, ksize=3)
+            sobely = cv2.Sobel(grayscale, cv2.CV_64F, 0, 1, ksize=3)
+        
         sobel_magnitude = np.sqrt(sobelx**2 + sobely**2)
         
         # Calculate mean gradient magnitude, excluding very low values
@@ -324,6 +476,9 @@ class AnalysisEngine:
         # Final contrast score
         contrast_score = 0.6 * global_score + 0.4 * local_score
         
+        # Libera memoria
+        del hist, sobelx, sobely, sobel_magnitude
+        
         return contrast_score
     
     def _calculate_noise(self, grayscale: np.ndarray) -> float:
@@ -333,15 +488,52 @@ class AnalysisEngine:
         """
         # Apply more sophisticated noise estimation
         
-        # Method 1: Use the difference between image and median filtered version
-        # This catches salt-and-pepper noise well
-        denoised_median = cv2.medianBlur(grayscale, 3)
-        noise_median = cv2.absdiff(grayscale, denoised_median)
-        noise_level_median = np.mean(noise_median)
+        # Tenta di usare la GPU se disponibile
+        if self.use_gpu and self.gpu_available and hasattr(cv2, 'cuda'):
+            try:
+                # Carica l'immagine sulla GPU
+                gpu_grayscale = cv2.cuda_GpuMat()
+                gpu_grayscale.upload(grayscale)
+                
+                # Filtri di denoising
+                gpu_median = cv2.cuda.createMedianFilter(cv2.CV_8U, 3)
+                gpu_gauss = cv2.cuda.createGaussianFilter(cv2.CV_8U, cv2.CV_8U, (5, 5), 0)
+                
+                # Applica filtri
+                gpu_denoised_median = gpu_median.apply(gpu_grayscale)
+                gpu_denoised_gauss = gpu_gauss.apply(gpu_grayscale)
+                
+                # Scarica risultati
+                denoised_median = gpu_denoised_median.download()
+                denoised_gauss = gpu_denoised_gauss.download()
+                
+                # Calcola differenze
+                noise_median = cv2.absdiff(grayscale, denoised_median)
+                noise_gauss = cv2.absdiff(grayscale, denoised_gauss)
+                
+                # Calcola Canny per la texture
+                gpu_edges = cv2.cuda.createCannyEdgeDetector(50, 150)
+                gpu_edges_result = gpu_edges.detect(gpu_grayscale)
+                edges = gpu_edges_result.download()
+                
+            except Exception as e:
+                self.logger.warning(f"Errore nell'elaborazione GPU per noise: {e}. Fallback a CPU.")
+                # Fallback a CPU
+                denoised_median = cv2.medianBlur(grayscale, 3)
+                denoised_gauss = cv2.GaussianBlur(grayscale, (5, 5), 0)
+                noise_median = cv2.absdiff(grayscale, denoised_median)
+                noise_gauss = cv2.absdiff(grayscale, denoised_gauss)
+                edges = cv2.Canny(grayscale, 50, 150)
+        else:
+            # Metodo CPU standard
+            denoised_median = cv2.medianBlur(grayscale, 3)
+            denoised_gauss = cv2.GaussianBlur(grayscale, (5, 5), 0)
+            noise_median = cv2.absdiff(grayscale, denoised_median)
+            noise_gauss = cv2.absdiff(grayscale, denoised_gauss)
+            edges = cv2.Canny(grayscale, 50, 150)
         
-        # Method 2: Use Gaussian blur for smoother noise types
-        denoised_gauss = cv2.GaussianBlur(grayscale, (5, 5), 0)
-        noise_gauss = cv2.absdiff(grayscale, denoised_gauss)
+        # Calcoli standard indipendenti dall'uso di GPU/CPU
+        noise_level_median = np.mean(noise_median)
         noise_level_gauss = np.mean(noise_gauss)
         
         # Combined noise level (median is more sensitive to outliers/noise)
@@ -349,7 +541,6 @@ class AnalysisEngine:
         
         # Account for image content - textures can be mistaken for noise
         # Check if image has a lot of edges (textured)
-        edges = cv2.Canny(grayscale, 50, 150)
         edge_ratio = np.count_nonzero(edges) / edges.size
         
         # Adjust noise level based on texture - textured images get a "discount"
@@ -359,6 +550,11 @@ class AnalysisEngine:
         
         # Convert to score (0-100) where higher is better (less noise)
         noise_score = max(0, 100 - (adjusted_noise_level * 10))
+        
+        # Libera memoria
+        del denoised_median, noise_median
+        del denoised_gauss, noise_gauss
+        del edges
         
         return noise_score
     
@@ -373,9 +569,33 @@ class AnalysisEngine:
         h_lines = [height / 3, 2 * height / 3]
         v_lines = [width / 3, 2 * width / 3]
         
-        # Calculate interest points based on high gradient areas
-        sobelx = cv2.Sobel(grayscale, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(grayscale, cv2.CV_64F, 0, 1, ksize=3)
+        # Tenta di usare la GPU se disponibile
+        if self.use_gpu and self.gpu_available and hasattr(cv2, 'cuda'):
+            try:
+                # Carica l'immagine sulla GPU
+                gpu_grayscale = cv2.cuda_GpuMat()
+                gpu_grayscale.upload(grayscale)
+                
+                # Sobel X e Y
+                gpu_sobelx = cv2.cuda.createSobelFilter(cv2.CV_64F, 1, 0)
+                gpu_sobely = cv2.cuda.createSobelFilter(cv2.CV_64F, 0, 1)
+                
+                gpu_result_x = gpu_sobelx.apply(gpu_grayscale)
+                gpu_result_y = gpu_sobely.apply(gpu_grayscale)
+                
+                sobelx = gpu_result_x.download()
+                sobely = gpu_result_y.download()
+                
+            except Exception as e:
+                self.logger.warning(f"Errore nell'elaborazione GPU per rule of thirds: {e}. Fallback a CPU.")
+                # Fallback a CPU
+                sobelx = cv2.Sobel(grayscale, cv2.CV_64F, 1, 0, ksize=3)
+                sobely = cv2.Sobel(grayscale, cv2.CV_64F, 0, 1, ksize=3)
+        else:
+            # Metodo CPU standard
+            sobelx = cv2.Sobel(grayscale, cv2.CV_64F, 1, 0, ksize=3)
+            sobely = cv2.Sobel(grayscale, cv2.CV_64F, 0, 1, ksize=3)
+        
         magnitude = np.sqrt(sobelx**2 + sobely**2)
         
         # Threshold gradient map to find significant edges/features
@@ -452,6 +672,10 @@ class AnalysisEngine:
                 power_point_bonus += 2.5  # Each power point with a feature adds bonus
         
         final_score = min(100, rule_thirds_score + power_point_bonus)
+        
+        # Libera memoria
+        del sobelx, sobely, magnitude, significant_features, interest_map
+        
         return final_score
     
     def _analyze_symmetry(self, grayscale: np.ndarray) -> float:
@@ -508,6 +732,11 @@ class AnalysisEngine:
         
         # Normalize to 0-100
         symmetry_score = min(100, symmetry_score)
+        
+        # Libera memoria
+        del left, right, h_diff, h_weight
+        del top, bottom, v_diff, v_weight
+        
         return symmetry_score
     
     def _detect_faces_improved(self, grayscale: np.ndarray) -> List[Tuple[int, int, int, int]]:
@@ -566,6 +795,11 @@ class AnalysisEngine:
                 x, y, w, h = face
                 all_faces.append((grayscale.shape[1] - x - w, y, w, h))
         
+        # Libera memoria
+        del enhanced
+        if 'flipped' in locals():
+            del flipped
+        
         return self._merge_overlapping_faces(all_faces)
     
     def _merge_overlapping_faces(self, faces: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
@@ -620,7 +854,6 @@ class AnalysisEngine:
         
         # Convert back to (x, y, w, h) format
         return [(x1, y1, x2-x1, y2-y1) for (x1, y1, x2, y2) in merged_faces]
-    
     def _filter_faces(self, face_locations: List[Tuple[int, int, int, int]], 
                      image_shape: Tuple[int, int]) -> List[Tuple[int, int, int, int]]:
         """
@@ -713,6 +946,9 @@ class AnalysisEngine:
                       
             qualities.append(min(100, quality))
             
+            # Libera memoria
+            del laplacian, hist
+            
         return qualities
     
     def _analyze_subject_position_improved(self, grayscale: np.ndarray, 
@@ -803,14 +1039,40 @@ class AnalysisEngine:
         """
         height, width = grayscale.shape
         
-        # Use multiple methods to estimate subject position:
+        # Usa la GPU se disponibile
+        if self.use_gpu and self.gpu_available and hasattr(cv2, 'cuda'):
+            try:
+                # Carica l'immagine sulla GPU
+                gpu_grayscale = cv2.cuda_GpuMat()
+                gpu_grayscale.upload(grayscale)
+                
+                # Canny edge detection
+                gpu_edges = cv2.cuda.createCannyEdgeDetector(50, 150)
+                gpu_edges_result = gpu_edges.detect(gpu_grayscale)
+                edges = gpu_edges_result.download()
+                
+                # Sobel per il gradiente
+                gpu_sobelx = cv2.cuda.createSobelFilter(cv2.CV_64F, 1, 0)
+                gpu_sobely = cv2.cuda.createSobelFilter(cv2.CV_64F, 0, 1)
+                
+                gpu_result_x = gpu_sobelx.apply(gpu_grayscale)
+                gpu_result_y = gpu_sobely.apply(gpu_grayscale)
+                
+                sobelx = gpu_result_x.download()
+                sobely = gpu_result_y.download()
+                
+            except Exception as e:
+                self.logger.warning(f"Errore nell'elaborazione GPU per subject position: {e}. Fallback a CPU.")
+                # Fallback a CPU
+                edges = cv2.Canny(grayscale, 50, 150)
+                sobelx = cv2.Sobel(grayscale, cv2.CV_64F, 1, 0, ksize=3)
+                sobely = cv2.Sobel(grayscale, cv2.CV_64F, 0, 1, ksize=3)
+        else:
+            # Metodo CPU standard
+            edges = cv2.Canny(grayscale, 50, 150)
+            sobelx = cv2.Sobel(grayscale, cv2.CV_64F, 1, 0, ksize=3)
+            sobely = cv2.Sobel(grayscale, cv2.CV_64F, 0, 1, ksize=3)
         
-        # 1. Edge detection to find areas with detail
-        edges = cv2.Canny(grayscale, 50, 150)
-        
-        # 2. Gradient magnitude to find areas with changes
-        sobelx = cv2.Sobel(grayscale, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(grayscale, cv2.CV_64F, 0, 1, ksize=3)
         magnitude = np.sqrt(sobelx**2 + sobely**2)
         
         # Create a saliency map combining both
@@ -825,6 +1087,10 @@ class AnalysisEngine:
         # Find contours of salient regions
         contours, _ = cv2.findContours(binary.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
+        # Libera memoria prima dell'operazione che potrebbe usare molta memoria
+        del sobelx, sobely, magnitude, edges
+        gc.collect()
+        
         if not contours:
             # Special case for landscapes or minimalist compositions
             # Check for horizon line
@@ -833,6 +1099,9 @@ class AnalysisEngine:
             edges = cv2.Canny(grayscale, 50, 150)
             lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, 
                                    minLineLength=width//3, maxLineGap=20)
+            
+            # Libera memoria
+            del edges, binary, saliency
             
             if lines is not None:
                 horizon_candidates = []
@@ -854,6 +1123,9 @@ class AnalysisEngine:
                     
                     # Score based on distance to thirds line
                     horizon_score = max(0, 100 - (min_dist / (height / 6) * 100))
+                    
+                    # Libera memoria
+                    del lines, horizon_candidates
                     
                     return horizon_score
             
@@ -909,13 +1181,17 @@ class AnalysisEngine:
             
             position_scores.append(position_score * (0.5 + 0.5 * area_weight))
         
+        # Libera memoria
+        del contours, binary, saliency
+        
         # Calculate final score
         if position_scores:
             # Prioritize the main subject but consider secondary elements
             max_score = max(position_scores)
             avg_score = sum(position_scores) / len(position_scores)
             
-            return 0.7 * max_score + 0.3 * avg_score
+            result = 0.7 * max_score + 0.3 * avg_score
+            return result
         else:
             return 50.0  # Default value
     
@@ -937,6 +1213,30 @@ class AnalysisEngine:
         """
         Calculate Canny edge map for the image.
         """
+        # Usa la GPU se disponibile
+        if self.use_gpu and self.gpu_available and hasattr(cv2, 'cuda'):
+            try:
+                # Carica l'immagine sulla GPU
+                gpu_grayscale = cv2.cuda_GpuMat()
+                gpu_grayscale.upload(grayscale)
+                
+                # Calcola valori medi e deviazione standard per threshold adattivo
+                mean_val = np.mean(grayscale)
+                std_val = np.std(grayscale)
+                
+                # Calcola threshold per Canny
+                lower = max(10, int(max(0, mean_val - std_val)))
+                upper = min(250, int(min(255, mean_val + std_val)))
+                
+                # Crea e applica il detector Canny
+                gpu_edges = cv2.cuda.createCannyEdgeDetector(lower, upper)
+                gpu_edges_result = gpu_edges.detect(gpu_grayscale)
+                return gpu_edges_result.download()
+                
+            except Exception as e:
+                self.logger.warning(f"Errore nell'elaborazione GPU per edge map: {e}. Fallback a CPU.")
+                # Fallback a CPU
+        
         # Adaptive thresholding for better edge detection
         mean_val = np.mean(grayscale)
         std_val = np.std(grayscale)

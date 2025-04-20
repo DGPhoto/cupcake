@@ -1,331 +1,366 @@
-#!/usr/bin/env python3
-# examples/complete_workflow.py
-#
-# Questo script dimostra un flusso di lavoro completo con Cupcake:
-# 1. Inizializzazione dell'applicazione con impostazioni personalizzate
-# 2. Caricamento e analisi delle immagini RAW
-# 3. Valutazione delle immagini usando profili personalizzati
-# 4. Selezione automatica e manuale delle immagini
-# 5. Esportazione dei risultati
+# complete_workflow.py
 
 import os
 import sys
 import logging
-from pathlib import Path
-import time
+import gc
+from typing import List, Dict, Any, Optional
+from tqdm import tqdm
+import psutil
 import argparse
+import time
 
-# Aggiungiamo il percorso radice del progetto per l'importazione
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Aggiusta il path Python per trovare il modulo 'src'
+sys.path.append(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 
-# Importazione dei componenti Cupcake
-from src import get_settings, initialize_application
-from src.rating_system import RatingCategory
-from src.storage_manager import ExportFormat, NamingPattern, FolderStructure
+# Importa i componenti Cupcake
+from src.image_loader import ImageLoader
+from src.analysis_engine import AnalysisEngine
+from src.rating_system import RatingSystem, RatingCategory
+from src.selection_manager import SelectionManager, SelectionStatus
+from src.error_suppressor import ErrorSuppressor
+from src.storage_manager import StorageManager, ExportFormat
+from src.user_settings import UserSettings
 
-def setup_arguments():
-    """Setup command line arguments."""
-    parser = argparse.ArgumentParser(description='Cupcake Photo Culling Library - Workflow completo')
-    
-    parser.add_argument('--input-dir', '-i', type=str, 
-                        help='Directory di input contenente le immagini')
-    
-    parser.add_argument('--output-dir', '-o', type=str,
-                        help='Directory di output per le immagini selezionate')
-    
-    parser.add_argument('--profile', '-p', type=str, default="black_and_white",
-                        help='Profilo di rating da utilizzare (default: black_and_white)')
-    
-    parser.add_argument('--format', '-f', type=str, default="original",
-                        choices=['original', 'jpeg', 'tiff', 'png'],
-                        help='Formato di esportazione (default: original)')
-                        
-    parser.add_argument('--threshold', '-t', type=float, default=75.0,
-                        help='Soglia di auto-selezione (default: 75.0)')
-    
-    parser.add_argument('--verbose', '-v', action='store_true',
-                        help='Abilita output verboso')
-    
-    return parser.parse_args()
+# Configura il logger
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('cupcake_workflow.log')
+    ]
+)
 
-def print_section(title):
-    """Print a section title."""
-    width = 80
-    print("\n" + "=" * width)
-    print(f"{title:^{width}}")
-    print("=" * width + "\n")
+# Silenzia i logger troppo verbosi
+logging.getLogger('exifread').setLevel(logging.ERROR)
+logging.getLogger('cupcake.analysis').setLevel(logging.WARNING)
 
-def print_progress(current, total, message="Elaborazione"):
-    """Print progress bar."""
-    width = 50
-    progress = int(width * current / total)
-    sys.stdout.write("\r{0}: [{1}{2}] {3}/{4} ".format(
-        message, "#" * progress, "." * (width - progress), current, total))
-    sys.stdout.flush()
+logger = logging.getLogger("cupcake.workflow")
 
-def main():
-    """Main workflow demonstration."""
-    # Parse arguments
-    args = setup_arguments()
+# Funzione per il monitoraggio della memoria
+def get_memory_usage():
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / 1024 / 1024
+    return f"{memory_mb:.1f} MB"
+
+def process_batch(image_files: List[str], 
+                loader: ImageLoader,
+                analysis_engine: AnalysisEngine,
+                rating_system: RatingSystem,
+                selection_manager: SelectionManager,
+                rating_profile: str = "default",
+                auto_culling: bool = True,
+                culling_threshold: float = 75.0,
+                pbar=None) -> Dict[str, int]:
+    """
+    Processa un batch di immagini.
     
-    # Setup logging
-    logging_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(level=logging_level, 
-                       format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    logger = logging.getLogger("cupcake.workflow")
+    Args:
+        image_files: Lista di file da processare
+        loader: Istanza di ImageLoader
+        analysis_engine: Istanza di AnalysisEngine
+        rating_system: Istanza di RatingSystem
+        selection_manager: Istanza di SelectionManager
+        rating_profile: Nome del profilo di rating
+        auto_culling: Se selezionare automaticamente le immagini
+        culling_threshold: Soglia per selezione automatica
+        pbar: Progress bar
+        
+    Returns:
+        Statistiche del batch
+    """
+    stats = {
+        "processed": 0,
+        "selected": 0,
+        "rejected": 0,
+        "errors": 0
+    }
     
-    print_section("CUPCAKE PHOTO CULLING LIBRARY - WORKFLOW COMPLETO")
+    for file_path in image_files:
+        try:
+            # Carica e analizza l'immagine
+            with ErrorSuppressor.suppress_stderr():
+                image_data, metadata = loader.load_from_path(file_path)
+                
+                # Aggiorna la barra di progresso
+                if pbar:
+                    file_name = os.path.basename(file_path)
+                    mem_usage = get_memory_usage()
+                    pbar.set_postfix_str(f"File: {file_name} | Mem: {mem_usage}")
+                
+                # Registra immagine
+                image_id = file_path
+                selection_manager.register_image(image_id, metadata)
+                
+                # Analizza l'immagine
+                analysis_result = analysis_engine.analyze_image(image_data, metadata)
+                
+                # Valuta l'immagine
+                rating = rating_system.rate_image(
+                    analysis_result,
+                    image_id,
+                    profile_name=rating_profile
+                )
+                
+                # Selezione automatica
+                if auto_culling:
+                    if rating.overall_score >= culling_threshold:
+                        selection_manager.mark_as_selected(image_id)
+                        stats["selected"] += 1
+                    else:
+                        selection_manager.mark_as_rejected(image_id)
+                        stats["rejected"] += 1
+                
+                stats["processed"] += 1
+                
+                # Libera memoria
+                del image_data
+                del analysis_result
+            
+        except Exception as e:
+            logger.error(f"Error loading {file_path}: {str(e)}")
+            stats["errors"] += 1
+        
+        # Forza il garbage collector dopo ogni immagine
+        gc.collect()
+        
+        # Aggiorna la progress bar
+        if pbar:
+            pbar.update(1)
     
-    # 1. Inizializzazione applicazione con impostazioni personalizzate
-    print("Inizializzazione applicazione...")
+    return stats
+
+def process_directory(
+    directory_path: str,
+    output_dir: Optional[str] = None,
+    rating_profile: str = "default",
+    export_format: ExportFormat = ExportFormat.ORIGINAL,
+    auto_culling: bool = True,
+    culling_threshold: float = 75.0,
+    batch_size: int = 10,
+    use_gpu: Optional[bool] = None
+) -> Dict[str, Any]:
+    """
+    Processa tutte le immagini in una directory con Cupcake.
     
-    # Ottieni impostazioni e inizializza applicazione
-    settings = get_settings()
+    Args:
+        directory_path: Percorso alla directory con le immagini
+        output_dir: Directory di output (opzionale)
+        rating_profile: Nome del profilo di rating da usare
+        export_format: Formato di esportazione
+        auto_culling: Se selezionare automaticamente le immagini in base al rating
+        culling_threshold: Soglia di rating per la selezione automatica
+        batch_size: Numero di immagini da processare in un batch
+        use_gpu: Se usare l'accelerazione GPU (None = usa impostazione predefinita)
+        
+    Returns:
+        Dizionario con statistiche di elaborazione
+    """
+    # Carica le impostazioni utente
+    settings = UserSettings()
     
-    # Configura directory di output da args o usa impostazioni
-    if args.output_dir:
-        output_dir = args.output_dir
-        settings.set_setting("output_directory", output_dir)
-    else:
-        output_dir = settings.get_output_directory()
+    # Determina se usare la GPU in base ai parametri e alle impostazioni utente
+    if use_gpu is None:
+        use_gpu = settings.get_setting("use_gpu", False)
     
-    print(f"Directory di output: {output_dir}")
+    # Inizializza componenti
+    loader = ImageLoader()
     
-    # Crea profilo specializzato per bianco e nero se non esiste
-    profile_name = args.profile
-    if profile_name not in settings.profiles and profile_name == "black_and_white":
-        print(f"Creazione profilo specializzato per bianco e nero...")
-        settings.create_specialized_profile("black_and_white", "black_and_white")
+    # Configura l'uso della GPU 
+    config = {"use_gpu": use_gpu}
+    analysis_engine = AnalysisEngine(config)
     
-    # Inizializza componenti applicazione
-    components = initialize_application()
-    image_loader = components["image_loader"]
-    analysis_engine = components["analysis_engine"]
-    rating_system = components["rating_system"]
-    selection_manager = components["selection_manager"]
-    storage_manager = components["storage_manager"]
+    # Verifica se la GPU è effettivamente usata
+    gpu_available = analysis_engine.gpu_available
     
-    # 2. Determina directory input
-    if args.input_dir:
-        input_dir = args.input_dir
-    else:
-        # Chiedi directory se non specificata
-        input_dir = input("Inserisci il percorso della directory con le immagini: ")
+    rating_system = RatingSystem()
+    selection_manager = SelectionManager(f"Session-{os.path.basename(directory_path)}")
     
-    if not os.path.exists(input_dir) or not os.path.isdir(input_dir):
-        print(f"Errore: directory non valida '{input_dir}'")
-        return
+    logger.info(f"Inizializzazione elaborazione per: {directory_path}")
+    logger.info(f"Utilizzo GPU: {'Sì' if gpu_available else 'No'}")
+    logger.info(f"Memoria iniziale: {get_memory_usage()}")
     
-    # Aggiungi directory ai recenti
-    settings.add_recent_directory(input_dir)
+    # Verifica directory
+    if not os.path.exists(directory_path) or not os.path.isdir(directory_path):
+        logger.error(f"La directory {directory_path} non esiste")
+        return {"error": f"La directory {directory_path} non esiste"}
     
-    print_section("CARICAMENTO IMMAGINI")
+    # Trova tutte le immagini nella directory
+    image_files = []
+    for root, _, files in os.walk(directory_path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            ext = os.path.splitext(file)[1].lower().lstrip('.')
+            
+            from src.image_formats import ImageFormats
+            if ImageFormats.is_supported_format(ext):
+                image_files.append(file_path)
     
-    # Carica immagini dalla directory
-    print(f"Caricamento immagini da: {input_dir}")
+    if not image_files:
+        logger.error(f"Nessuna immagine trovata in {directory_path}")
+        return {"error": "Nessuna immagine trovata"}
+    
+    logger.info(f"Trovate {len(image_files)} immagini in {directory_path}")
+    
+    # Registra la directory come recente nelle impostazioni
+    settings.add_recent_directory(directory_path)
+    
+    # Statistiche totali
+    total_images = len(image_files)
+    processed = 0
+    selected = 0
+    rejected = 0
+    errors = 0
+    
+    # Tempo di inizio
     start_time = time.time()
     
-    try:
-        image_results = image_loader.load_from_directory(input_dir)
-        load_time = time.time() - start_time
-        
-        print(f"Caricamento completato in {load_time:.2f} secondi")
-        print(f"Trovate {len(image_results)} immagini")
-        
-        # Mostra alcuni esempi di immagini caricate
-        if image_results:
-            print("\nEsempio delle prime immagini caricate:")
-            for i, (path, _, metadata) in enumerate(image_results[:3]):
-                filename = os.path.basename(path)
-                print(f"  {i+1}. {filename} - {metadata.get('extension', '?').upper()}")
-                if 'camera_make' in metadata and 'camera_model' in metadata:
-                    print(f"     {metadata['camera_make']} {metadata['camera_model']}")
-    except Exception as e:
-        logger.error(f"Errore nel caricamento delle immagini: {e}")
-        return
-    
-    if not image_results:
-        print("Nessuna immagine trovata nella directory specificata.")
-        return
-    
-    # Registra immagini con il selection manager
-    selection_manager.register_images_from_loader(image_results)
-    
-    print_section("ANALISI E VALUTAZIONE")
-    
-    # 3. Analisi e valutazione delle immagini
-    print(f"Analisi delle immagini con profilo: {profile_name}")
-    
-    # Strutture dati per tenere traccia dei risultati
-    analysis_results = {}
-    image_ratings = {}
-    
-    # Analizza ogni immagine
-    total_images = len(image_results)
-    for i, (path, image_data, metadata) in enumerate(image_results):
-        # Mostra progresso
-        print_progress(i+1, total_images, "Analisi")
-        
-        try:
-            # Analizza l'immagine
-            analysis_result = analysis_engine.analyze_image(image_data, metadata)
-            analysis_results[path] = analysis_result
+    # Crea la barra di progresso
+    with tqdm(total=total_images, desc=f"Analisi immagini") as pbar:
+        # Suddividi i file in batch
+        for i in range(0, len(image_files), batch_size):
+            # Estrai il batch corrente
+            batch = image_files[i:i+batch_size]
             
-            # Valuta l'immagine con il profilo specificato
-            image_rating = rating_system.rate_image(
-                analysis_result, path, profile_name, 
-                apply_preferences=True  # Applica preferenze se disponibili
+            # Aggiorna la barra con informazioni sul batch
+            batch_info = f"Batch {i//batch_size+1}/{(total_images+batch_size-1)//batch_size}"
+            pbar.set_description(batch_info)
+            
+            # Processa il batch
+            batch_stats = process_batch(
+                batch,
+                loader,
+                analysis_engine,
+                rating_system,
+                selection_manager,
+                rating_profile,
+                auto_culling,
+                culling_threshold,
+                pbar
             )
-            image_ratings[path] = image_rating
             
-            # Logging dettagliato se verboso
-            if args.verbose and i < 5:  # Dettagli solo per le prime 5 immagini
-                logger.debug(f"Valutazione di {os.path.basename(path)}:")
-                logger.debug(f"  Technical: {image_rating.technical_score:.1f}")
-                logger.debug(f"  Composition: {image_rating.composition_score:.1f}")
-                logger.debug(f"  Overall: {image_rating.overall_score:.1f}")
-                logger.debug(f"  Rating: {image_rating.rating_category.name}")
-                
-        except Exception as e:
-            logger.error(f"Errore nell'analisi di {path}: {e}")
-    
-    print()  # Newline after progress bar
-    
-    # Calcola statistiche delle valutazioni
-    rating_counts = {category: 0 for category in RatingCategory}
-    for rating in image_ratings.values():
-        rating_counts[rating.rating_category] += 1
-    
-    print("\nDistribuzione delle valutazioni:")
-    for category, count in rating_counts.items():
-        percentage = (count / total_images) * 100 if total_images > 0 else 0
-        print(f"  {category.name}: {count} ({percentage:.1f}%)")
-    
-    print_section("SELEZIONE AUTOMATICA")
-    
-    # 4. Selezione automatica delle immagini
-    threshold = args.threshold
-    print(f"Selezione automatica delle immagini (soglia: {threshold})")
-    
-    # Conta selezioni e rifiuti
-    selected_count = 0
-    rejected_count = 0
-    
-    # Seleziona immagini in base al punteggio
-    for path, rating in image_ratings.items():
-        if rating.overall_score >= threshold:
-            selection_manager.mark_as_selected(path)
-            selected_count += 1
-        else:
-            selection_manager.mark_as_rejected(path)
-            rejected_count += 1
-    
-    print(f"Immagini selezionate automaticamente: {selected_count}")
-    print(f"Immagini rifiutate automaticamente: {rejected_count}")
-    
-    # Stampare alcune delle immagini selezionate
-    selected_images = selection_manager.get_selected_images()
-    if selected_images:
-        print("\nEsempio di immagini selezionate:")
-        for i, path in enumerate(selected_images[:5]):
-            rating = image_ratings[path]
-            filename = os.path.basename(path)
-            print(f"  {i+1}. {filename} - Punteggio: {rating.overall_score:.1f}")
-    
-    # 5. Opzione per selezione manuale interattiva
-    interactive = input("\nVuoi visualizzare e selezionare manualmente le immagini? (s/n): ").lower()
-    
-    if interactive.startswith('s'):
-        print_section("SELEZIONE MANUALE")
-        print("Modalità selezione manuale. Per ogni immagine, puoi:")
-        print("  s - Seleziona")
-        print("  r - Rifiuta")
-        print("  n - Prossima immagine (mantieni stato attuale)")
-        print("  q - Termina selezione manuale")
-        
-        # Ottieni tutte le immagini
-        all_images = selection_manager.get_collection_images()
-        
-        # Interfaccia di selezione manuale semplice
-        for i, path in enumerate(all_images):
-            rating = image_ratings[path]
-            image_info = selection_manager.get_image_info(path)
-            status = image_info["status"]
+            # Aggiorna le statistiche totali
+            processed += batch_stats["processed"]
+            selected += batch_stats["selected"]
+            rejected += batch_stats["rejected"]
+            errors += batch_stats["errors"]
             
-            filename = os.path.basename(path)
-            
-            # Mostra informazioni sull'immagine
-            print(f"\nImmagine {i+1}/{len(all_images)}: {filename}")
-            print(f"  Rating: {rating.rating_category.name} (Punteggio: {rating.overall_score:.1f})")
-            print(f"  Stato attuale: {status.name}")
-            
-            # Chiedi azione utente
-            action = input("Azione [s/r/n/q]: ").lower()
-            
-            if action == 'q':
-                break
-            elif action == 's':
-                selection_manager.mark_as_selected(path)
-                print(f"  → Immagine selezionata")
-            elif action == 'r':
-                selection_manager.mark_as_rejected(path)
-                print(f"  → Immagine rifiutata")
+            # Dopo ogni batch, libera completamente la memoria
+            gc.collect()
     
-    print_section("ESPORTAZIONE")
+    # Calcola il tempo totale
+    total_time = time.time() - start_time
+    images_per_second = processed / total_time if total_time > 0 else 0
     
-    # 6. Esportazione delle immagini selezionate
-    # Determina formato di esportazione
-    format_map = {
-        "original": ExportFormat.ORIGINAL,
-        "jpeg": ExportFormat.JPEG,
-        "tiff": ExportFormat.TIFF,
-        "png": ExportFormat.PNG
+    # Mostra statistiche finali
+    stats = {
+        "totale": total_images,
+        "elaborati": processed,
+        "selezionati": selected,
+        "rifiutati": rejected,
+        "errori": errors,
+        "memoria_finale": get_memory_usage(),
+        "tempo_totale": total_time,
+        "immagini_al_secondo": images_per_second,
+        "gpu_utilizzata": gpu_available
     }
-    export_format = format_map.get(args.format, ExportFormat.ORIGINAL)
     
-    # Aggiorna conteggio di immagini selezionate
-    selected_images = selection_manager.get_selected_images()
-    selected_count = len(selected_images)
+    logger.info(f"Elaborazione completata:")
+    logger.info(f"  Totale: {total_images} immagini")
+    logger.info(f"  Elaborati: {processed} immagini")
+    logger.info(f"  Selezionati: {selected} immagini")
+    logger.info(f"  Rifiutati: {rejected} immagini")
+    logger.info(f"  Errori: {errors} immagini")
+    logger.info(f"  Tempo totale: {total_time:.1f} secondi ({images_per_second:.2f} img/s)")
+    logger.info(f"  Memoria finale: {get_memory_usage()}")
     
-    if selected_count == 0:
-        print("Nessuna immagine selezionata da esportare.")
-        return
-    
-    print(f"Esportazione di {selected_count} immagini nel formato {args.format}...")
-    print(f"Directory di output: {output_dir}")
-    
-    # Esecuzione esportazione
-    try:
-        start_time = time.time()
+    # Esporta risultati se richiesto
+    if output_dir:
+        logger.info(f"Esportazione in corso verso {output_dir}...")
         
-        export_result = storage_manager.export_selected(
-            selection_manager,
-            output_dir,
-            export_format=export_format,
-            naming_pattern=NamingPattern.ORIGINAL,
-            folder_structure=FolderStructure.DATE,
-            jpeg_quality=90 if export_format == ExportFormat.JPEG else None,
-            include_xmp=True,
-            overwrite=True
-        )
+        # Visualizza una nuova barra di progresso per l'esportazione
+        with tqdm(total=selected, desc="Esportazione") as export_pbar:
+            def progress_callback(current, total):
+                export_pbar.update(1)
+                export_pbar.set_postfix_str(f"Mem: {get_memory_usage()}")
+            
+            storage_manager = StorageManager(output_dir)
+            export_stats = storage_manager.export_selected(
+                selection_manager,
+                output_dir,
+                export_format=export_format,
+                progress_callback=progress_callback
+            )
         
-        export_time = time.time() - start_time
-        
-        print(f"Esportazione completata in {export_time:.2f} secondi")
-        print(f"Risultati esportazione:")
-        print(f"  Esportate: {export_result['exported']}")
-        print(f"  Saltate: {export_result['skipped']}")
-        print(f"  Errori: {export_result['errors']}")
-        
-        if export_result['exported'] > 0:
-            print(f"\nLe immagini selezionate sono state esportate in:")
-            print(f"  {os.path.abspath(output_dir)}")
+        logger.info(f"Esportati {export_stats['exported']} file in {output_dir}")
+        stats["esportati"] = export_stats['exported']
     
-    except Exception as e:
-        logger.error(f"Errore nell'esportazione: {e}")
+    # Rilascia memoria finale
+    gc.collect()
     
-    print_section("COMPLETATO")
-    print("Workflow Cupcake completato con successo!")
+    return stats
+
+def main():
+    parser = argparse.ArgumentParser(description="Cupcake Photo Culling Workflow")
+    parser.add_argument("--input-dir", required=True, help="Directory with images to process")
+    parser.add_argument("--output-dir", help="Output directory for selected images")
+    parser.add_argument("--profile", default="default", help="Rating profile to use")
+    parser.add_argument("--threshold", type=float, default=75.0, help="Auto-culling threshold")
+    parser.add_argument("--batch-size", type=int, default=10, help="Batch size for processing")
+    parser.add_argument("--format", default="original", choices=["original", "jpeg", "tiff", "png"], 
+                        help="Export format")
+    parser.add_argument("--use-gpu", action="store_true", help="Use GPU acceleration if available")
+    parser.add_argument("--no-gpu", action="store_true", help="Disable GPU acceleration")
+    parser.add_argument("--verbose", action="store_true", help="Show verbose output")
+    
+    args = parser.parse_args()
+    
+    # Configura il livello di logging in base a verbose
+    if args.verbose:
+        logging.getLogger("cupcake").setLevel(logging.DEBUG)
+    else:
+        logging.getLogger("cupcake").setLevel(logging.INFO)
+    
+    # Converti il formato in enum
+    export_format = ExportFormat.ORIGINAL
+    if args.format == "jpeg":
+        export_format = ExportFormat.JPEG
+    elif args.format == "tiff":
+        export_format = ExportFormat.TIFF
+    elif args.format == "png":
+        export_format = ExportFormat.PNG
+    
+    # Determina l'uso della GPU
+    use_gpu = None  # Default alle impostazioni utente
+    if args.use_gpu:
+        use_gpu = True
+    elif args.no_gpu:
+        use_gpu = False
+    
+    stats = process_directory(
+        args.input_dir,
+        args.output_dir,
+        args.profile,
+        export_format,
+        True,  # auto_culling sempre attivo
+        args.threshold,
+        args.batch_size,
+        use_gpu
+    )
+    
+    print(f"\nElaborazione completata:")
+    print(f"  Totale: {stats['totale']} immagini")
+    print(f"  Elaborati: {stats['elaborati']} immagini")
+    print(f"  Selezionati: {stats['selezionati']} immagini")
+    print(f"  Errori: {stats['errori']} immagini")
+    print(f"  Tempo totale: {stats['tempo_totale']:.1f} secondi ({stats['immagini_al_secondo']:.2f} img/s)")
+    print(f"  GPU utilizzata: {'Sì' if stats['gpu_utilizzata'] else 'No'}")
+    print(f"  Memoria finale: {stats['memoria_finale']}")
+    
+    if 'esportati' in stats:
+        print(f"  Esportati: {stats['esportati']} immagini in {args.output_dir}")
 
 if __name__ == "__main__":
     main()
