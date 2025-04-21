@@ -6,6 +6,7 @@ import exifread
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 from .image_formats import ImageFormats
+from .raw_handling import get_raw_handler, RawHandlingError
 
 # Import the error suppressor
 try:
@@ -34,6 +35,7 @@ class ImageLoader:
     
     def __init__(self):
         self.image_cache = {}  # Simple cache to avoid reloading
+        self.raw_handler = get_raw_handler()
     
     def load_from_path(self, path: str) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
@@ -58,16 +60,20 @@ class ImageLoader:
         
         # Load image data based on format
         if ImageFormats.is_raw_format(extension):
-            # RAW file handling
+            # RAW file handling with new raw handler
             try:
-                import rawpy
-                # Use error suppressor to hide libraw error messages
                 with ErrorSuppressor.suppress_stderr():
-                    with rawpy.imread(path) as raw:
-                        image_data = raw.postprocess()
-            except ImportError:
-                raise ImportError("rawpy is required for RAW file support. Please install it with: pip install rawpy")
-            except Exception as e:
+                    image_data, raw_metadata = self.raw_handler.process_raw_file(path)
+                
+                # Extract additional metadata
+                metadata = self.extract_metadata(path)
+                
+                # Merge raw-specific metadata if available
+                if raw_metadata:
+                    for key, value in raw_metadata.items():
+                        if key not in metadata or not metadata[key]:
+                            metadata[key] = value
+            except RawHandlingError as e:
                 raise IOError(f"Error processing RAW file: {str(e)}")
         else:
             # Standard formats
@@ -76,9 +82,9 @@ class ImageLoader:
                     image_data = np.array(img)
             except Exception as e:
                 raise IOError(f"Error opening image: {str(e)}")
-        
-        # Extract metadata
-        metadata = self.extract_metadata(path)
+            
+            # Extract metadata
+            metadata = self.extract_metadata(path)
         
         # Store in cache
         self.image_cache[path] = (image_data, metadata)
@@ -181,10 +187,6 @@ class ImageLoader:
             import datetime
             metadata['datetime'] = datetime.datetime.now().strftime("%Y:%m:%d %H:%M:%S")
         
-        # Try to get more metadata from RAW files if available
-        if metadata['is_raw'] and not metadata.get('camera_make') and not metadata.get('camera_model'):
-            self._extract_raw_metadata(path, metadata)
-        
         return metadata
     
     def _extract_rational(self, tag) -> float:
@@ -194,29 +196,14 @@ class ImageLoader:
         except (AttributeError, ZeroDivisionError):
             return 0.0
     
-    def _extract_raw_metadata(self, path: str, metadata: Dict[str, Any]) -> None:
+    def register_raw_plugin(self, plugin):
         """
-        Try to extract additional metadata from RAW files.
+        Register a RAW processing plugin with the raw handler.
         
         Args:
-            path: Path to the RAW file
-            metadata: Metadata dictionary to update
+            plugin: A plugin object with process_raw_file method
         """
-        try:
-            import rawpy
-            with ErrorSuppressor.suppress_stderr():
-                with rawpy.imread(path) as raw:
-                    if hasattr(raw, 'raw_type') and raw.raw_type:
-                        metadata['raw_type'] = str(raw.raw_type)
-                    
-                    if hasattr(raw, 'camera_maker') and raw.camera_maker:
-                        metadata['camera_make'] = raw.camera_maker
-                    
-                    if hasattr(raw, 'camera_model') and raw.camera_model:
-                        metadata['camera_model'] = raw.camera_model
-        except (ImportError, Exception):
-            # Just skip if rawpy is not available or errors occur
-            pass
+        self.raw_handler.register_plugin(plugin)
     
     def clear_cache(self):
         """Clear the image cache to free memory."""

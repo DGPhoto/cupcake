@@ -16,12 +16,15 @@ imagehash>=4.2.0
 opencv-contrib-python>=4.5.0  # Adds GPU support modules
 #tensorflow-gpu>=2.8.0  # Uncomment for TF with GPU support
 
-# Raw file support
-rawpy>=0.17.0
-
 # Machine learning for plugins
 tensorflow>=2.8.0
 
 # Utilities
 tqdm>=4.62.0
 psutil>=5.8.0
+
+# Note: rawpy has been removed in favor of the built-in RAW handling system
+# For advanced RAW processing, install LibRaw on your system:
+# - Windows: https://www.libraw.org/download
+# - macOS: brew install libraw
+# - Linux: apt install libraw-dev or yum install libraw-devel

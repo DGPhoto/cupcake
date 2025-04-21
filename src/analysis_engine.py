@@ -85,6 +85,217 @@ class AnalysisEngine:
             self.face_cascade = None
             self.profile_cascade = None
             self.logger.warning("Face detection not available. OpenCV haar cascades not found.")
+            
+    def _calculate_histogram(self, image_data: np.ndarray) -> np.ndarray:
+        """
+        Calculate histogram data for an image.
+        
+        Args:
+            image_data: Image data as numpy array
+            
+        Returns:
+            Histogram data
+        """
+        # Check if image is color or grayscale
+        if len(image_data.shape) == 3 and image_data.shape[2] >= 3:
+            # Color image - calculate histogram for each channel
+            hist_r = cv2.calcHist([image_data], [0], None, [256], [0, 256])
+            hist_g = cv2.calcHist([image_data], [1], None, [256], [0, 256])
+            hist_b = cv2.calcHist([image_data], [2], None, [256], [0, 256])
+            
+            # Normalize histograms
+            if np.sum(hist_r) > 0:
+                hist_r = hist_r / np.sum(hist_r)
+            if np.sum(hist_g) > 0:
+                hist_g = hist_g / np.sum(hist_g)
+            if np.sum(hist_b) > 0:
+                hist_b = hist_b / np.sum(hist_b)
+            
+            # Combine channels
+            hist_data = np.concatenate([hist_r, hist_g, hist_b], axis=1)
+        else:
+            # Grayscale image
+            hist_data = cv2.calcHist([image_data], [0], None, [256], [0, 256])
+            if np.sum(hist_data) > 0:
+                hist_data = hist_data / np.sum(hist_data)
+        
+        return hist_data   
+    
+    def _calculate_edge_map(self, grayscale: np.ndarray) -> np.ndarray:
+        """
+        Calculate edge map for an image.
+        
+        Args:
+            grayscale: Grayscale image data
+            
+        Returns:
+            Edge map
+        """
+        try:
+            # Use GPU manager if available
+            if self.use_gpu and self.gpu_available:
+                try:
+                    # Use Canny edge detection
+                    edge_map = self.gpu_manager.apply_filter(
+                        grayscale,
+                        'canny',
+                        low_threshold=50,
+                        high_threshold=150
+                    )
+                except Exception as e:
+                    self.logger.warning(f"GPU edge detection failed: {e}. Falling back to CPU.")
+                    edge_map = cv2.Canny(grayscale, 50, 150)
+            else:
+                # Use standard CPU Canny edge detector
+                edge_map = cv2.Canny(grayscale, 50, 150)
+            
+            return edge_map
+        except Exception as e:
+            self.logger.error(f"Error calculating edge map: {e}")
+            # Return empty edge map on error
+            return np.zeros_like(grayscale)    
+                
+    def _analyze_generic_subject_position(self, grayscale: np.ndarray) -> float:
+        """
+        Analyze subject positioning when no faces are detected.
+        Uses edge detection and saliency to estimate subject position.
+        
+        Args:
+            grayscale: Grayscale image data
+            
+        Returns:
+            Score for subject positioning (0-100)
+        """
+        height, width = grayscale.shape
+        
+        # Apply edge detection to find potential subjects
+        try:
+            # Use GPU manager if available
+            if self.use_gpu and self.gpu_available:
+                edges = self.gpu_manager.apply_filter(grayscale, 'canny', low_threshold=50, high_threshold=150)
+            else:
+                edges = cv2.Canny(grayscale, 50, 150)
+        except Exception as e:
+            self.logger.warning(f"Error in edge detection: {e}")
+            edges = np.zeros_like(grayscale)
+        
+        # If no significant edges found, use basic center-weighted approach
+        if np.count_nonzero(edges) < (width * height * 0.01):
+            # Use gradient-based saliency as fallback
+            gx = cv2.Sobel(grayscale, cv2.CV_64F, 1, 0, ksize=3)
+            gy = cv2.Sobel(grayscale, cv2.CV_64F, 0, 1, ksize=3)
+            magnitude = np.sqrt(gx**2 + gy**2)
+            
+            # Normalize magnitude
+            if np.max(magnitude) > 0:
+                magnitude = magnitude / np.max(magnitude)
+            
+            # Apply center weighting
+            center_y, center_x = height // 2, width // 2
+            y_grid, x_grid = np.ogrid[:height, :width]
+            dist_from_center = np.sqrt((x_grid - center_x)**2 + (y_grid - center_y)**2)
+            max_dist = np.sqrt(center_x**2 + center_y**2)
+            center_weight = 1 - (dist_from_center / max_dist)
+            
+            # Combine magnitude and center weight
+            saliency_map = magnitude * center_weight
+        else:
+            # Use edges to create a saliency map
+            saliency_map = edges.astype(float) / 255.0
+        
+        # Create a rule of thirds grid
+        thirds_h = [height // 3, 2 * height // 3]
+        thirds_w = [width // 3, 2 * width // 3]
+        
+        # Define power points (intersections of thirds lines)
+        power_points = [
+            (thirds_w[0], thirds_h[0]),  # Top-left
+            (thirds_w[1], thirds_h[0]),  # Top-right
+            (thirds_w[0], thirds_h[1]),  # Bottom-left
+            (thirds_w[1], thirds_h[1])   # Bottom-right
+        ]
+        
+        # Find regions with highest saliency
+        region_size = min(width, height) // 10
+        max_saliency = 0
+        best_point = None
+        
+        for point in power_points:
+            px, py = point
+            # Define region around power point
+            x_start = max(0, px - region_size)
+            x_end = min(width, px + region_size)
+            y_start = max(0, py - region_size)
+            y_end = min(height, py + region_size)
+            
+            # Calculate average saliency in this region
+            region_saliency = np.mean(saliency_map[y_start:y_end, x_start:x_end])
+            
+            if region_saliency > max_saliency:
+                max_saliency = region_saliency
+                best_point = point
+        
+        # If we found a good power point with salient content
+        if best_point and max_saliency > 0.1:
+            # Calculate score based on how well the salient region aligns with rule of thirds
+            score = 80.0 + (max_saliency * 20.0)  # Base score 80-100 depending on saliency strength
+        else:
+            # If no clear subject found at power points, check general distribution
+            center_saliency = np.mean(saliency_map[height//3:2*height//3, width//3:2*width//3])
+            edge_saliency = np.mean(saliency_map) - center_saliency
+            
+            if center_saliency > edge_saliency:
+                # Centrally composed image, lower score but still reasonable
+                score = 60.0 + (center_saliency * 20.0)
+            else:
+                # Unclear composition, give moderate score
+                score = 50.0
+        
+        # Clean up
+        del edges, saliency_map
+        if 'gx' in locals():
+            del gx, gy, magnitude
+        
+        return min(100.0, max(0.0, score))
+                
+    def _filter_faces(self, face_locations, image_shape):
+        """
+        Filter out likely false positive face detections.
+        
+        Args:
+            face_locations: List of face locations (x, y, w, h)
+            image_shape: Shape of the grayscale image
+            
+        Returns:
+            Filtered list of face locations
+        """
+        if not face_locations:
+            return []
+            
+        # Get image dimensions
+        height, width = image_shape[:2]
+        
+        # Filter faces based on size and position criteria
+        filtered_locations = []
+        min_face_size = min(width, height) / 20  # Minimum size relative to image
+        
+        for (x, y, w, h) in face_locations:
+            # Skip faces that are too small
+            if w < min_face_size or h < min_face_size:
+                continue
+                
+            # Skip faces that are too large (likely false positive)
+            if w > width * 0.9 or h > height * 0.9:
+                continue
+                
+            # Skip faces with extreme aspect ratios (not face-like)
+            aspect_ratio = float(w) / h
+            if aspect_ratio < 0.5 or aspect_ratio > 2.0:
+                continue
+                
+            filtered_locations.append((x, y, w, h))
+        
+        return filtered_locations
     
     def analyze_image(self, image_data: np.ndarray, metadata: Dict[str, Any] = None) -> ImageAnalysisResult:
         """
