@@ -6,10 +6,15 @@ Pillow>=9.0.0
 exifread>=2.3.2
 
 # Image processing
-opencv-python>=4.5.0
+#opencv-python>=4.5.0
+#opencv-python-headless>=4.5.0  # Alternative without GUI dependencies
 scikit-image>=0.19.0
 scikit-learn>=1.0.0
 imagehash>=4.2.0
+
+# Optional GPU support
+opencv-contrib-python>=4.5.0  # Adds GPU support modules
+#tensorflow-gpu>=2.8.0  # Uncomment for TF with GPU support
 
 # Raw file support
 rawpy>=0.17.0

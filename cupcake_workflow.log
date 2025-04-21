@@ -58,3 +58,14 @@
 2025-04-20 21:47:01,602 - cupcake.workflow - INFO - Memoria iniziale: 372.2 MB
 2025-04-20 21:47:01,603 - cupcake.workflow - INFO - Trovate 100 immagini in F:\RAW\TEST
 2025-04-20 21:47:01,603 - cupcake.settings - INFO - Saved configuration to C:\Users\nonso\.cupcake\settings\config.json
+2025-04-21 00:08:07,364 - cupcake.settings - INFO - Loaded configuration from C:\Users\nonso\.cupcake\settings\config.json
+2025-04-21 00:08:07,385 - cupcake.gpu - INFO - OpenCV CUDA support NOT detected. Using CPU fallback for image processing.
+2025-04-21 00:08:19,695 - cupcake.gpu - INFO - TensorFlow GPU support NOT detected. Using CPU for ML operations.
+2025-04-21 00:08:19,695 - cupcake.analysis - WARNING - Face detection not available. OpenCV haar cascades not found.
+2025-04-21 00:08:19,695 - cupcake.workflow - INFO - Inizializzazione elaborazione per: F:\RAW\TEST
+2025-04-21 00:08:19,695 - cupcake.workflow - INFO - Utilizzo GPU: No
+2025-04-21 00:08:19,695 - cupcake.workflow - INFO - Memoria iniziale: 257.8 MB
+2025-04-21 00:08:19,695 - cupcake.workflow - INFO - Trovate 100 immagini in F:\RAW\TEST
+2025-04-21 00:08:19,695 - cupcake.settings - INFO - Saved configuration to C:\Users\nonso\.cupcake\settings\config.json
+2025-04-21 00:08:37,007 - cupcake.workflow - ERROR - Error loading F:\RAW\TEST\JKLE9001.RAF: 'AnalysisEngine' object has no attribute '_filter_faces'
+2025-04-21 00:08:53,068 - cupcake.workflow - ERROR - Error loading F:\RAW\TEST\JKLE9002.RAF: 'AnalysisEngine' object has no attribute '_filter_faces'

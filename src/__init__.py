@@ -1,6 +1,4 @@
-# Aggiungiamo UserSettings al modulo __init__.py principale
-# Aggiornamento di src/__init__.py
-
+# Aggiungiamo UserSettings e GPUManager al modulo __init__.py principale
 import os
 import sys
 import logging
@@ -14,9 +12,10 @@ from .selection_manager import SelectionManager, SelectionStatus, ColorLabel
 from .storage_manager import StorageManager, ExportFormat, NamingPattern, FolderStructure
 from .plugin_system import PluginManager, CupcakePlugin, PluginType, PluginHook
 from .error_suppressor import ErrorSuppressor
-from .user_settings import UserSettings  # Aggiungiamo il nostro nuovo modulo
+from .user_settings import UserSettings
+from .gpu_utils import GPUManager  # Aggiungiamo il nuovo modulo
 
-__version__ = '0.2.0'  # Aggiorniamo la versione per includere il nuovo sistema di impostazioni
+__version__ = '0.2.1'  # Aggiorniamo la versione per includere il supporto GPU migliorato
 
 # Package information
 __all__ = [
@@ -40,11 +39,13 @@ __all__ = [
     'PluginType',
     'PluginHook',
     'ErrorSuppressor',
-    'UserSettings'  # Aggiungiamo il nostro componente
+    'UserSettings',
+    'GPUManager'  # Aggiungiamo il nostro componente
 ]
 
-# Singleton instance for global access
+# Singleton instances for global access
 _settings = None
+_gpu_manager = None
 
 def get_settings() -> UserSettings:
     """
@@ -58,6 +59,22 @@ def get_settings() -> UserSettings:
     if _settings is None:
         _settings = UserSettings()
     return _settings
+
+def get_gpu_manager(suppress_tf_warnings=True) -> GPUManager:
+    """
+    Get the global GPU manager instance.
+    Creates it if it doesn't exist.
+    
+    Args:
+        suppress_tf_warnings: Whether to suppress TensorFlow warnings
+        
+    Returns:
+        GPUManager instance
+    """
+    global _gpu_manager
+    if _gpu_manager is None:
+        _gpu_manager = GPUManager(suppress_tf_warnings=suppress_tf_warnings)
+    return _gpu_manager
 
 # Initialize logging
 def setup_logging(level=logging.INFO):
@@ -83,8 +100,9 @@ def setup_logging(level=logging.INFO):
     
     # Also log to file if enabled in settings
     if _settings and _settings.get_setting("enable_file_logging", False):
+        import datetime
         log_dir = _settings.get_setting("log_directory", 
-                                      os.path.join(os.path.expanduser("~"), ".cupcake", "logs"))
+                                     os.path.join(os.path.expanduser("~"), ".cupcake", "logs"))
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f"cupcake_{datetime.datetime.now().strftime('%Y%m%d')}.log")
         
@@ -93,31 +111,7 @@ def setup_logging(level=logging.INFO):
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
-# Esempio di utilizzo:
-"""
-# In qualsiasi altro modulo, possiamo importare e usare get_settings:
-
-from src import get_settings
-
-# Ottieni impostazioni
-settings = get_settings()
-
-# Ottieni e imposta valori
-output_dir = settings.get_setting("output_directory")
-settings.set_setting("jpeg_quality", 90)
-
-# Carica un profilo di rating
-profile = settings.get_profile("landscape")
-
-# Oppure crea un profilo specializzato
-settings.create_specialized_profile("my_landscape", "landscape")
-
-# Ottieni il modello di preferenze per un profilo
-preference_model = settings.get_preference_model("my_landscape")
-"""
-
 # Esempio di inizializzazione dell'applicazione
-
 def initialize_application():
     """Initialize the Cupcake application with all components."""
     # Setup logging
@@ -129,9 +123,21 @@ def initialize_application():
     settings = get_settings()
     logger.info(f"Settings loaded from {settings.settings_dir}")
     
+    # Initialize GPU manager
+    gpu_manager = get_gpu_manager()
+    use_gpu = settings.get_setting("use_gpu", True)
+    
+    if use_gpu:
+        if gpu_manager.is_gpu_available():
+            logger.info(f"GPU support enabled. Using {gpu_manager.get_opencv_backend()} backend.")
+        else:
+            logger.info("GPU support requested but not available. Using CPU fallback.")
+    else:
+        logger.info("GPU support disabled in settings. Using CPU for processing.")
+    
     # Initialize components
     image_loader = ImageLoader()
-    analysis_engine = AnalysisEngine()
+    analysis_engine = AnalysisEngine({"use_gpu": use_gpu})
     
     # Get default rating profile from settings
     default_profile_name = settings.get_setting("default_rating_profile", "default")
@@ -171,6 +177,7 @@ def initialize_application():
     
     return {
         "settings": settings,
+        "gpu_manager": gpu_manager,
         "image_loader": image_loader,
         "analysis_engine": analysis_engine,
         "rating_system": rating_system,
