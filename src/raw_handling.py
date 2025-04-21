@@ -7,6 +7,7 @@ import numpy as np
 from PIL import Image, ExifTags
 from typing import Dict, Any, Optional, Tuple, List, Union
 import logging
+import traceback
 
 logger = logging.getLogger("cupcake.raw_handling")
 
@@ -121,6 +122,9 @@ class BasicRawHandler:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
         
+        # Normalize path to handle Windows path separators
+        file_path = os.path.normpath(file_path)
+        
         extension = os.path.splitext(file_path)[1].lower().lstrip('.')
         
         if not self.is_raw_format(extension):
@@ -130,16 +134,18 @@ class BasicRawHandler:
         for plugin in self.registered_plugins:
             try:
                 self.logger.debug(f"Trying plugin {plugin.__class__.__name__} for {file_path}")
-                if plugin.can_handle(extension):
+                if hasattr(plugin, "can_handle") and plugin.can_handle(extension):
                     return plugin.process_raw_file(file_path)
             except Exception as e:
                 self.logger.warning(f"Plugin {plugin.__class__.__name__} failed to process {file_path}: {e}")
+                self.logger.debug(traceback.format_exc())
         
         # Fall back to basic handling if no plugin succeeded
         try:
             return self._extract_preview_and_metadata(file_path)
         except Exception as e:
             self.logger.error(f"Failed to process RAW file {file_path}: {e}")
+            self.logger.debug(traceback.format_exc())
             raise RawProcessingError(f"Failed to process {file_path}: {str(e)}")
     
     def _extract_preview_and_metadata(self, file_path: str) -> Tuple[np.ndarray, Dict[str, Any]]:
@@ -160,19 +166,21 @@ class BasicRawHandler:
             if extension in ['cr2', 'nef', 'arw', 'dng']:
                 image_data = self._extract_jpeg_preview(file_path)
             elif extension == 'raf':  # Fujifilm RAF files need special handling
-                image_data = self._extract_raf_preview(file_path)
+                image_data = self._extract_raf_preview_improved(file_path)
             else:
                 # For unsupported formats, create a placeholder image
                 image_data = self._create_placeholder_image(file_path, metadata)
         except Exception as e:
             self.logger.warning(f"Failed to extract preview from {file_path}: {e}")
+            self.logger.debug(traceback.format_exc())
             image_data = self._create_placeholder_image(file_path, metadata)
         
         return image_data, metadata
 
-    def _extract_raf_preview(self, file_path: str) -> np.ndarray:
+    def _extract_raf_preview_improved(self, file_path: str) -> np.ndarray:
         """
-        Extract preview from Fujifilm RAF files which have a different structure.
+        Extract preview from Fujifilm RAF files with enhanced robustness.
+        RAF files have a more complex structure and require special handling.
         
         Args:
             file_path: Path to the RAF file
@@ -181,48 +189,119 @@ class BasicRawHandler:
             NumPy array containing the preview image
         """
         try:
+            # Try to open the RAF file directly with PIL first
+            # Some RAF files can be opened directly by PIL
+            try:
+                with Image.open(file_path) as img:
+                    # Force loading the image to ensure it's valid
+                    img.load()
+                    self.logger.debug(f"Successfully opened RAF file directly with PIL: {file_path}")
+                    return np.array(img)
+            except Exception as e:
+                self.logger.debug(f"PIL couldn't directly open RAF: {e}, falling back to preview extraction")
+            
             # Read the file in binary mode
             with open(file_path, 'rb') as f:
                 data = f.read()
             
             # RAF files typically have "FUJIFILMCCD-RAW" marker
             if b"FUJIFILMCCD-RAW" not in data[:100]:
-                raise RawProcessingError("Not a valid RAF file")
+                self.logger.warning(f"File doesn't appear to be a valid RAF file: {file_path}")
             
-            # Search for JPEG markers
-            # RAF files usually have the preview after "JPEG" marker
-            jpeg_marker = b"JPEG"
-            jpeg_marker_pos = data.find(jpeg_marker)
+            # Multiple approaches to find JPEG preview
+            approaches = [
+                # Approach 1: Look for JPEG after "JPEG" marker
+                lambda d: (d.find(b"JPEG"), d.find(b'\xff\xd8', d.find(b"JPEG")) if d.find(b"JPEG") != -1 else -1),
+                # Approach 2: Look for JPEG after "FUJIFILMCCD-RAW" marker
+                lambda d: (d.find(b"FUJIFILMCCD-RAW"), d.find(b'\xff\xd8', d.find(b"FUJIFILMCCD-RAW")) if d.find(b"FUJIFILMCCD-RAW") != -1 else -1),
+                # Approach 3: Look for first JPEG SOI marker
+                lambda d: (-1, d.find(b'\xff\xd8')),
+                # Approach 4: Look for JPEG SOI marker after position 1000 (to skip metadata)
+                lambda d: (-1, d.find(b'\xff\xd8', 1000)),
+                # Approach 5: Look for JPEG after position 2000
+                lambda d: (-1, d.find(b'\xff\xd8', 2000)),
+                # Approach 6: Try to find after a known RAF header marker
+                lambda d: (-1, d.find(b'\xff\xd8', d.find(b"RAF")) if d.find(b"RAF") != -1 else -1)
+            ]
             
-            if jpeg_marker_pos == -1:
-                # Fall back to searching for SOI marker
-                jpeg_start = data.find(b'\xff\xd8')
-            else:
-                # Look for SOI marker after the "JPEG" marker
-                jpeg_start = data.find(b'\xff\xd8', jpeg_marker_pos)
+            jpeg_start = -1
+            for approach in approaches:
+                marker_pos, start_pos = approach(data)
+                if start_pos != -1:
+                    jpeg_start = start_pos
+                    self.logger.debug(f"Found JPEG start at position {jpeg_start} after marker at {marker_pos}")
+                    break
             
             if jpeg_start == -1:
-                raise RawProcessingError("No JPEG preview found in RAF file")
+                self.logger.warning(f"No JPEG preview found in RAF file: {file_path}")
+                return self._create_placeholder_image(file_path, {"filename": os.path.basename(file_path)})
             
             # Find the end of the JPEG data
             jpeg_end = data.find(b'\xff\xd9', jpeg_start)
+            
+            # If we can't find a proper EOI marker, try to find the next SOI marker
+            # as an indicator of where this JPEG might end
             if jpeg_end == -1:
-                raise RawProcessingError("Incomplete JPEG preview found in RAF file")
+                next_soi = data.find(b'\xff\xd8', jpeg_start + 2)
+                if next_soi != -1:
+                    # Use the position before the next SOI as the end of current JPEG
+                    jpeg_end = next_soi - 2
+                else:
+                    # If all else fails, use a reasonable chunk of data after the start
+                    jpeg_end = min(jpeg_start + 1000000, len(data) - 2)  # 1MB limit or end of file
             
-            # Extract the JPEG data including the EOI marker
-            jpeg_data = data[jpeg_start:jpeg_end+2]
+            # Extract the JPEG data including the EOI marker if available
+            if jpeg_end > jpeg_start:
+                jpeg_data = data[jpeg_start:jpeg_end+2]
+            else:
+                # Fallback: just take a reasonable chunk after start
+                jpeg_data = data[jpeg_start:min(jpeg_start+1000000, len(data))]  # 1MB limit
             
-            # Convert to image
+            # Check if we got valid JPEG data
+            if not jpeg_data.startswith(b'\xff\xd8'):
+                self.logger.warning(f"Invalid JPEG data extracted from RAF file: {file_path}")
+                return self._create_placeholder_image(file_path, {"filename": os.path.basename(file_path)})
+            
+            # Convert to image, with error handling for truncated files
             try:
                 image = Image.open(io.BytesIO(jpeg_data))
+                # Force load to catch truncated file issues early
+                image.load()
                 return np.array(image)
             except Exception as e:
-                raise RawProcessingError(f"Failed to decode JPEG preview: {str(e)}")
+                self.logger.warning(f"Failed to decode JPEG preview: {str(e)}")
+                # Try again with just part of the data to handle truncated files
+                try:
+                    # Take the first 90% of the data to avoid potential corruption
+                    safe_size = int(len(jpeg_data) * 0.9)
+                    safe_jpeg = jpeg_data[:safe_size]
+                    image = Image.open(io.BytesIO(safe_jpeg))
+                    image.load()
+                    return np.array(image)
+                except Exception as e2:
+                    self.logger.warning(f"Failed to decode JPEG preview with reduced size: {str(e2)}")
+                    # One last attempt: try to find another JPEG in the file
+                    try:
+                        # Look for another JPEG SOI marker after the failed one
+                        next_jpeg_start = data.find(b'\xff\xd8', jpeg_start + 100)
+                        if next_jpeg_start != -1:
+                            next_jpeg_end = data.find(b'\xff\xd9', next_jpeg_start)
+                            if next_jpeg_end != -1:
+                                next_jpeg_data = data[next_jpeg_start:next_jpeg_end+2]
+                                image = Image.open(io.BytesIO(next_jpeg_data))
+                                image.load()
+                                return np.array(image)
+                    except Exception:
+                        # If all attempts failed, create placeholder
+                        pass
+                    
+                    return self._create_placeholder_image(file_path, {"filename": os.path.basename(file_path)})
         
         except Exception as e:
             self.logger.error(f"Error extracting RAF preview: {e}")
-            # Create an empty image as fallback
-            return np.zeros((600, 800, 3), dtype=np.uint8)
+            self.logger.debug(traceback.format_exc())
+            # Create a placeholder image as fallback
+            return self._create_placeholder_image(file_path, {"filename": os.path.basename(file_path)})
     
     def _extract_jpeg_preview(self, file_path: str) -> np.ndarray:
         """
@@ -234,6 +313,14 @@ class BasicRawHandler:
         Returns:
             NumPy array containing the preview image
         """
+        # Try to open with PIL first
+        try:
+            with Image.open(file_path) as img:
+                img.load()  # Force load to catch errors early
+                return np.array(img)
+        except Exception as e:
+            self.logger.debug(f"PIL couldn't open file directly: {e}, trying binary extraction")
+        
         # Read the file in binary mode
         with open(file_path, 'rb') as f:
             data = f.read()
@@ -246,16 +333,30 @@ class BasicRawHandler:
         # Find the end of the JPEG data
         jpeg_end = data.find(b'\xff\xd9', jpeg_start)
         if jpeg_end == -1:
-            raise RawProcessingError("Incomplete JPEG preview found in file")
-        
-        # Extract the JPEG data including the EOI marker
-        jpeg_data = data[jpeg_start:jpeg_end+2]
+            # Try a more lenient approach - take a reasonable chunk
+            chunk_size = min(10*1024*1024, len(data) - jpeg_start)  # 10MB or end of file
+            jpeg_data = data[jpeg_start:jpeg_start + chunk_size]
+        else:
+            # Extract the JPEG data including the EOI marker
+            jpeg_data = data[jpeg_start:jpeg_end+2]
         
         # Convert to image
         try:
             image = Image.open(io.BytesIO(jpeg_data))
+            image.load()  # Force load to catch errors early
             return np.array(image)
         except Exception as e:
+            try:
+                # Try with reduced size for possibly truncated files
+                safe_size = int(len(jpeg_data) * 0.9)
+                if safe_size > 1000:  # Ensure we have enough data to work with
+                    safe_jpeg = jpeg_data[:safe_size]
+                    image = Image.open(io.BytesIO(safe_jpeg))
+                    image.load()
+                    return np.array(image)
+            except Exception:
+                pass
+                
             raise RawProcessingError(f"Failed to decode JPEG preview: {str(e)}")
     
     def _create_placeholder_image(self, file_path: str, metadata: Dict[str, Any]) -> np.ndarray:

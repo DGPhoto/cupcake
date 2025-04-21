@@ -4,6 +4,7 @@ import sys
 import logging
 import gc
 from tqdm import tqdm
+import numpy as np
 
 # Import modules from the Cupcake library
 from src import initialize_application
@@ -24,6 +25,7 @@ def run(params: Dict[str, Any]) -> Dict[str, Any]:
         --no-gpu               Force CPU fallback
         --verbose              Show detailed progress
         --skip-export          Skip exporting selected images
+        --debug-scores         Print detailed score information
 
     Example:
         cupcake analyze-directory --input-dir ./photos --output-dir ./selected --profile portrait --threshold 85
@@ -44,6 +46,7 @@ def run(params: Dict[str, Any]) -> Dict[str, Any]:
     threshold = float(params.get("threshold", 75.0))
     verbose = params.get("verbose", False)
     batch_size = int(params.get("batch_size", 10))
+    debug_scores = params.get("debug_scores", False) or "debug" in params
     
     # Configure GPU usage
     use_gpu = True  # Default to True
@@ -64,7 +67,7 @@ def run(params: Dict[str, Any]) -> Dict[str, Any]:
     
     # Setup logging
     logger = logging.getLogger("cupcake.analyze_directory")
-    logger.setLevel(logging.INFO if verbose else logging.WARNING)
+    logger.setLevel(logging.INFO if verbose or debug_scores else logging.WARNING)
     
     # Get components from the application
     image_loader = app["image_loader"]
@@ -88,7 +91,8 @@ def run(params: Dict[str, Any]) -> Dict[str, Any]:
         "selected": 0,
         "rejected": 0,
         "errors": 0,
-        "exported": 0
+        "exported": 0,
+        "detailed_scores": {}  # For storing detailed scores
     }
     
     # Find all images in the directory
@@ -127,8 +131,38 @@ def run(params: Dict[str, Any]) -> Dict[str, Any]:
                 image_id = file_path
                 selection_manager.register_image(image_id, metadata)
                 
+                # Debug info about image
+                if debug_scores:
+                    print(f"\n{'='*50}")
+                    print(f"Image: {os.path.basename(file_path)}")
+                    print(f"Size: {image_data.shape}")
+                    print(f"Type: {image_data.dtype}")
+                    print(f"Format: {metadata.get('extension', 'unknown')}")
+                    print(f"Camera: {metadata.get('camera_make', 'unknown')} {metadata.get('camera_model', '')}")
+                
+                # Add a hook to detect empty arrays during analysis
+                original_np_mean = np.mean
+                
+                def debug_mean(a, *args, **kwargs):
+                    if a.size == 0:
+                        print(f"WARNING: Empty array passed to np.mean() during analysis")
+                        print(f"Array shape: {a.shape}, dtype: {a.dtype}")
+                        print(f"Caller: {sys._getframe().f_back.f_code.co_name}")
+                        # Return 0 for empty arrays instead of raising a warning
+                        return 0.0
+                    return original_np_mean(a, *args, **kwargs)
+                
+                # Replace np.mean temporarily for debugging
+                if debug_scores:
+                    np.mean = debug_mean
+                
                 # Analyze image
-                analysis_result = analysis_engine.analyze_image(image_data, metadata)
+                try:
+                    analysis_result = analysis_engine.analyze_image(image_data, metadata)
+                finally:
+                    # Restore original np.mean
+                    if debug_scores:
+                        np.mean = original_np_mean
                 
                 # Rate image
                 rating = rating_system.rate_image(
@@ -136,6 +170,38 @@ def run(params: Dict[str, Any]) -> Dict[str, Any]:
                     image_id, 
                     profile_name=rating_profile
                 )
+                
+                # Store detailed scores for reporting
+                if debug_scores:
+                    # Print detailed scores
+                    print(f"\nValutazione dettagliata per {os.path.basename(file_path)}:")
+                    print(f"  Punteggio tecnico: {rating.technical_score:.1f}")
+                    print(f"    - Nitidezza: {rating.sharpness_score:.1f}")
+                    print(f"    - Esposizione: {rating.exposure_score:.1f}")
+                    print(f"    - Contrasto: {rating.contrast_score:.1f}")
+                    print(f"    - Rumore: {rating.noise_score:.1f}")
+                    print(f"  Punteggio composizione: {rating.composition_score:.1f}")
+                    print(f"    - Regola dei terzi: {rating.rule_of_thirds_score:.1f}")
+                    print(f"    - Simmetria: {rating.symmetry_score:.1f}")
+                    print(f"    - Posizione soggetto: {rating.subject_position_score:.1f}")
+                    print(f"  Punteggio complessivo: {rating.overall_score:.1f}")
+                    print(f"  Soglia di selezione: {threshold}")
+                    print(f"  Risultato: {'Selezionato' if rating.overall_score >= threshold else 'Rifiutato'}")
+                    
+                    # Store scores in stats
+                    stats["detailed_scores"][os.path.basename(file_path)] = {
+                        "technical_score": rating.technical_score,
+                        "sharpness_score": rating.sharpness_score,
+                        "exposure_score": rating.exposure_score,
+                        "contrast_score": rating.contrast_score,
+                        "noise_score": rating.noise_score,
+                        "composition_score": rating.composition_score,
+                        "rule_of_thirds_score": rating.rule_of_thirds_score,
+                        "symmetry_score": rating.symmetry_score,
+                        "subject_position_score": rating.subject_position_score,
+                        "overall_score": rating.overall_score,
+                        "result": "Selected" if rating.overall_score >= threshold else "Rejected"
+                    }
                 
                 # Apply selection based on threshold
                 if rating.overall_score >= threshold:
@@ -154,6 +220,9 @@ def run(params: Dict[str, Any]) -> Dict[str, Any]:
                 
             except Exception as e:
                 logger.error(f"Error processing {file_path}: {str(e)}")
+                if debug_scores:
+                    import traceback
+                    traceback.print_exc()
                 stats["errors"] += 1
     
     # Export selected images if requested
@@ -181,6 +250,28 @@ def run(params: Dict[str, Any]) -> Dict[str, Any]:
         session_file = params.get("save_session")
         selection_manager.save_to_json(session_file)
         logger.info(f"Selection session saved to {session_file}")
+    
+    # Print summary of scores if debug_scores
+    if debug_scores and stats["detailed_scores"]:
+        print("\n" + "="*50)
+        print("RIEPILOGO PUNTEGGI:")
+        print("="*50)
+        
+        # Calculate averages
+        avg_technical = sum(data["technical_score"] for data in stats["detailed_scores"].values()) / len(stats["detailed_scores"])
+        avg_composition = sum(data["composition_score"] for data in stats["detailed_scores"].values()) / len(stats["detailed_scores"])
+        avg_overall = sum(data["overall_score"] for data in stats["detailed_scores"].values()) / len(stats["detailed_scores"])
+        
+        print(f"Punteggio tecnico medio: {avg_technical:.1f}")
+        print(f"Punteggio composizione medio: {avg_composition:.1f}")
+        print(f"Punteggio complessivo medio: {avg_overall:.1f}")
+        print(f"Soglia di selezione: {threshold}")
+        print(f"Selezionate: {stats['selected']}/{stats['total_images']} ({stats['selected']/stats['total_images']*100:.1f}%)")
+        print("="*50)
+    
+    # Remove detailed scores before returning
+    if "detailed_scores" in stats:
+        del stats["detailed_scores"]
     
     return {
         "status": "completed",

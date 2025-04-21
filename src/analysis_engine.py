@@ -228,8 +228,12 @@ class AnalysisEngine:
             y_start = max(0, py - region_size)
             y_end = min(height, py + region_size)
             
-            # Calculate average saliency in this region
-            region_saliency = np.mean(saliency_map[y_start:y_end, x_start:x_end])
+            # Calculate average saliency in this region with checking for empty regions
+            region = saliency_map[y_start:y_end, x_start:x_end]
+            if region.size > 0 and np.any(region):
+                region_saliency = np.mean(region)
+            else:
+                region_saliency = 0.0
             
             if region_saliency > max_saliency:
                 max_saliency = region_saliency
@@ -241,8 +245,20 @@ class AnalysisEngine:
             score = 80.0 + (max_saliency * 20.0)  # Base score 80-100 depending on saliency strength
         else:
             # If no clear subject found at power points, check general distribution
-            center_saliency = np.mean(saliency_map[height//3:2*height//3, width//3:2*width//3])
-            edge_saliency = np.mean(saliency_map) - center_saliency
+            # Safely calculate center saliency
+            center_region = saliency_map[height//3:2*height//3, width//3:2*width//3]
+            if center_region.size > 0 and np.any(center_region):
+                center_saliency = np.mean(center_region)
+            else:
+                center_saliency = 0.0
+            
+            # Safely calculate edge saliency
+            if saliency_map.size > 0 and np.any(saliency_map):
+                overall_saliency = np.mean(saliency_map)
+            else:
+                overall_saliency = 0.0
+                
+            edge_saliency = max(0.0, overall_saliency - center_saliency)
             
             if center_saliency > edge_saliency:
                 # Centrally composed image, lower score but still reasonable
@@ -256,7 +272,7 @@ class AnalysisEngine:
         if 'gx' in locals():
             del gx, gy, magnitude
         
-        return min(100.0, max(0.0, score))
+        return min(100.0, max(0.0, score))    
                 
     def _filter_faces(self, face_locations, image_shape):
         """
@@ -622,8 +638,14 @@ class AnalysisEngine:
         sobel_magnitude = np.sqrt(sobelx**2 + sobely**2)
         
         # Calculate mean gradient magnitude, excluding very low values
-        # to avoid counting flat areas
-        local_contrast = np.mean(sobel_magnitude[sobel_magnitude > 10])
+        # to avoid counting flat areas - with check for empty arrays
+        filtered_magnitude = sobel_magnitude[sobel_magnitude > 10]
+        if filtered_magnitude.size > 0:
+            local_contrast = np.mean(filtered_magnitude)
+        else:
+            # For placeholder images or very flat images, use a reasonable default
+            # or calculate mean of all gradients
+            local_contrast = np.mean(sobel_magnitude) * 2  # Scale up a bit
         
         # Combine global and local contrast
         # Normalize scores to 0-100
@@ -995,3 +1017,61 @@ class AnalysisEngine:
         
         # Convert back to (x, y, w, h) format
         return [(x1, y1, x2-x1, y2-y1) for (x1, y1, x2, y2) in merged_faces]
+    
+        
+    def _calculate_overall_technical_improved(self, result):
+        """
+        Calculate overall technical score with improved weighting.
+        
+        Args:
+            result: ImageAnalysisResult object
+            
+        Returns:
+            Overall technical score (0-100)
+        """
+        # Calculate technical score with appropriate weights
+        technical_score = (
+            0.35 * result.sharpness_score +
+            0.30 * result.exposure_score +
+            0.25 * result.contrast_score +
+            0.10 * result.noise_score
+        )
+        
+        return technical_score
+
+    def _calculate_overall_score_improved(self, result):
+        """
+        Calculate overall image score with improved weighting.
+        
+        Args:
+            result: ImageAnalysisResult object
+            
+        Returns:
+            Overall image score (0-100)
+        """
+        # Calculate overall score from technical and composition scores
+        overall_score = (
+            0.60 * result.overall_technical_score +
+            0.40 * result.overall_composition_score
+        )
+        
+        return overall_score
+    
+    def _calculate_overall_composition(self, result):
+        """
+        Calculate overall composition score.
+        
+        Args:
+            result: ImageAnalysisResult object
+            
+        Returns:
+            Overall composition score (0-100)
+        """
+        # Calculate composition score with appropriate weights
+        composition_score = (
+            0.40 * result.rule_of_thirds_score +
+            0.20 * result.symmetry_score +
+            0.40 * result.subject_position_score
+        )
+        
+        return composition_score

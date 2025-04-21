@@ -207,210 +207,121 @@ class LibRawPlugin(CupcakePlugin, IRawPlugin):
         """
         return extension.lower() in LibRawPlugin.SUPPORTED_FORMATS
     
-def process_raw_file(self, file_path: str) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """
-    Process a RAW file using LibRaw with timeout and error handling.
-    
-    Args:
-        file_path: Path to the RAW file
+    def process_raw_file(self, file_path: str) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """
+        Process a RAW file using LibRaw with timeout and error handling.
         
-    Returns:
-        Tuple of (image_data, metadata)
-        
-    Raises:
-        Exception: If processing fails
-    """
-    if not self.is_initialized or not self.libraw:
-        self.logger.error("LibRaw plugin is not initialized")
-        raise RuntimeError("LibRaw plugin is not initialized")
-    
-    # Create a new LibRaw processor
-    processor = self._create_processor()
-    if not processor:
-        self.logger.error("Failed to create LibRaw processor")
-        raise RuntimeError("Failed to create LibRaw processor")
-    
-    # Extract metadata before potentially timing out on processing
-    try:
-        metadata = self._extract_metadata(processor, file_path)
-    except Exception as e:
-        self.logger.warning(f"Error extracting metadata: {e}")
-        # Create basic metadata
-        metadata = {
-            'filename': os.path.basename(file_path),
-            'filepath': file_path,
-            'filesize': os.path.getsize(file_path),
-            'extension': os.path.splitext(file_path)[1].lower().lstrip('.'),
-            'is_raw': True,
-            'manufacturer': self.get_manufacturer_from_extension(file_path)
-        }
-    
-    # Process the RAW file with a timeout
-    try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._process_raw_with_timeout, processor, file_path)
-            # Set a timeout of 30 seconds
-            image_data = future.result(timeout=30)
-            return image_data, metadata
-    except TimeoutError:
-        self.logger.error(f"Processing timed out for {file_path}")
-        # Clean up the processor that might be hanging
-        try:
-            self.libraw.libraw_recycle(processor)
-            self.libraw.libraw_close(processor)
-        except:
-            pass
-        
-        # Return a placeholder image instead
-        self.logger.info("Generating placeholder image")
-        from src.raw_handling import BasicRawHandler
-        basic_handler = BasicRawHandler()
-        placeholder = basic_handler._create_placeholder_image(file_path, metadata)
-        return placeholder, metadata
-    except Exception as e:
-        self.logger.error(f"Error processing {file_path}: {e}")
-        # Clean up
-        try:
-            self.libraw.libraw_recycle(processor)
-            self.libraw.libraw_close(processor)
-        except:
-            pass
-        
-        # Re-raise the exception
-        raise
-
-def _process_raw_with_timeout(self, processor, file_path: str) -> np.ndarray:
-    """
-    Process a RAW file with the given processor.
-    This method is designed to be run in a separate thread with a timeout.
-    
-    Args:
-        processor: LibRaw processor
-        file_path: Path to RAW file
-        
-    Returns:
-        Processed image data
-    """
-    try:
-        # Open the file
-        result = self.libraw.libraw_open_file(processor, ctypes.c_char_p(file_path.encode('utf-8')))
-        if result != 0:
-            raise RuntimeError(f"LibRaw failed to open file: Error code {result}")
-        
-        # Unpack the raw data
-        result = self.libraw.libraw_unpack(processor)
-        if result != 0:
-            raise RuntimeError(f"LibRaw failed to unpack raw data: Error code {result}")
-        
-        # Set processing parameters
-        self._set_processing_params(processor)
-        
-        # Process the raw data
-        result = self.libraw.libraw_dcraw_process(processor)
-        if result != 0:
-            raise RuntimeError(f"LibRaw failed to process raw data: Error code {result}")
-        
-        # Get the processed image
-        image_data = self._get_processed_image(processor)
-        
-        return image_data
-    finally:
-        # Always clean up
-        try:
-            self.libraw.libraw_recycle(processor)
-            self.libraw.libraw_close(processor)
-        except:
-            pass
-
-def _load_libraw(self) -> bool:
-    """
-    Load the LibRaw library for the current platform.
-    
-    Returns:
-        True if successful, False otherwise
-    """
-    # Check for custom path first
-    if self.config.get('libraw_path'):
-        try:
-            self.libraw = ctypes.cdll.LoadLibrary(self.config['libraw_path'])
-            self.logger.info(f"Loaded LibRaw from custom path: {self.config['libraw_path']}")
-            return self._initialize_functions()
-        except (OSError, AttributeError) as e:
-            self.logger.warning(f"Failed to load LibRaw from custom path: {e}")
-    
-    # Try default paths for current platform
-    current_platform = platform.system()
-    if current_platform not in self.lib_paths:
-        self.logger.error(f"Unsupported platform: {current_platform}")
-        return False
-    
-    # Try each possible library name
-    for lib_name in self.lib_paths[current_platform]:
-        try:
-            self.libraw = ctypes.cdll.LoadLibrary(lib_name)
-            self.logger.info(f"Loaded LibRaw from: {lib_name}")
-            return self._initialize_functions()
-        except (OSError, AttributeError) as e:
-            self.logger.debug(f"Failed to load LibRaw from {lib_name}: {e}")
-    
-    # Try to find in common directories
-    common_dirs = []
-    if current_platform == "Windows":
-        common_dirs.extend([
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bin"),
-            os.path.dirname(os.path.abspath(__file__))
-        ])
-    elif current_platform == "Darwin":  # macOS
-        common_dirs.extend([
-            "/usr/local/lib",
-            "/opt/homebrew/lib"
-        ])
-    else:  # Linux
-        common_dirs.extend([
-            "/usr/lib",
-            "/usr/local/lib",
-            "/usr/lib64",
-            "/usr/local/lib64"
-        ])
-    
-    # Check common directories
-    for directory in common_dirs:
-        if not os.path.exists(directory):
-            continue
+        Args:
+            file_path: Path to the RAW file
             
-        for lib_name in self.lib_paths[current_platform]:
-            lib_path = os.path.join(directory, os.path.basename(lib_name))
-            if os.path.exists(lib_path):
-                try:
-                    self.libraw = ctypes.cdll.LoadLibrary(lib_path)
-                    self.logger.info(f"Loaded LibRaw from: {lib_path}")
-                    return self._initialize_functions()
-                except (OSError, AttributeError) as e:
-                    self.logger.debug(f"Failed to load LibRaw from {lib_path}: {e}")
-    
-    self.logger.error("Failed to load LibRaw library. Please install LibRaw or specify a valid path.")
-    return False
+        Returns:
+            Tuple of (image_data, metadata)
+            
+        Raises:
+            Exception: If processing fails
+        """
+        if not self.is_initialized or not self.libraw:
+            self.logger.error("LibRaw plugin is not initialized")
+            raise RuntimeError("LibRaw plugin is not initialized")
+        
+        # Create a new LibRaw processor
+        processor = self._create_processor()
+        if not processor:
+            self.logger.error("Failed to create LibRaw processor")
+            raise RuntimeError("Failed to create LibRaw processor")
+        
+        # Extract metadata before potentially timing out on processing
+        try:
+            metadata = self._extract_metadata(processor, file_path)
+        except Exception as e:
+            self.logger.warning(f"Error extracting metadata: {e}")
+            # Create basic metadata
+            metadata = {
+                'filename': os.path.basename(file_path),
+                'filepath': file_path,
+                'filesize': os.path.getsize(file_path),
+                'extension': os.path.splitext(file_path)[1].lower().lstrip('.'),
+                'is_raw': True,
+                'manufacturer': self.get_manufacturer_from_extension(file_path)
+            }
+        
+        # Process the RAW file with a timeout
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(self._process_raw_with_timeout, processor, file_path)
+                # Set a timeout of 30 seconds
+                image_data = future.result(timeout=30)
+                return image_data, metadata
+        except TimeoutError:
+            self.logger.error(f"Processing timed out for {file_path}")
+            # Clean up the processor that might be hanging
+            try:
+                self.libraw.libraw_recycle(processor)
+                self.libraw.libraw_close(processor)
+            except:
+                pass
+            
+            # Return a placeholder image instead
+            self.logger.info("Generating placeholder image")
+            from src.raw_handling import BasicRawHandler
+            basic_handler = BasicRawHandler()
+            placeholder = basic_handler._create_placeholder_image(file_path, metadata)
+            return placeholder, metadata
+        except Exception as e:
+            self.logger.error(f"Error processing {file_path}: {e}")
+            # Clean up
+            try:
+                self.libraw.libraw_recycle(processor)
+                self.libraw.libraw_close(processor)
+            except:
+                pass
+            
+            # Re-raise the exception
+            raise
 
-def get_manufacturer_from_extension(self, file_path: str) -> str:
-    """Get manufacturer from file extension."""
-    ext = os.path.splitext(file_path)[1].lower().lstrip('.')
-    for manufacturer, extensions in {
-        'Canon': ['cr2', 'cr3', 'crw'],
-        'Nikon': ['nef', 'nrw'],
-        'Sony': ['arw', 'srf', 'sr2'],
-        'Fujifilm': ['raf'],
-        'Olympus': ['orf'],
-        'Panasonic': ['rw2'],
-        'Pentax': ['pef', 'dng'],
-        'Leica': ['raw', 'rwl', 'dng'],
-        'Hasselblad': ['3fr', 'fff'],
-        'Phase One': ['iiq'],
-        'Sigma': ['x3f']
-    }.items():
-        if ext in extensions:
-            return manufacturer
-    return "Unknown"
+    def _process_raw_with_timeout(self, processor, file_path: str) -> np.ndarray:
+        """
+        Process a RAW file with the given processor.
+        This method is designed to be run in a separate thread with a timeout.
+        
+        Args:
+            processor: LibRaw processor
+            file_path: Path to RAW file
+            
+        Returns:
+            Processed image data
+        """
+        try:
+            # Open the file
+            result = self.libraw.libraw_open_file(processor, ctypes.c_char_p(file_path.encode('utf-8')))
+            if result != 0:
+                raise RuntimeError(f"LibRaw failed to open file: Error code {result}")
+            
+            # Unpack the raw data
+            result = self.libraw.libraw_unpack(processor)
+            if result != 0:
+                raise RuntimeError(f"LibRaw failed to unpack raw data: Error code {result}")
+            
+            # Set processing parameters
+            self._set_processing_params(processor)
+            
+            # Process the raw data
+            result = self.libraw.libraw_dcraw_process(processor)
+            if result != 0:
+                raise RuntimeError(f"LibRaw failed to process raw data: Error code {result}")
+            
+            # Get the processed image
+            image_data = self._get_processed_image(processor)
+            
+            return image_data
+        finally:
+            # Always clean up
+            try:
+                self.libraw.libraw_recycle(processor)
+                self.libraw.libraw_close(processor)
+            except:
+                pass
+
     def _load_libraw(self) -> bool:
         """
         Load the LibRaw library for the current platform.
@@ -442,8 +353,64 @@ def get_manufacturer_from_extension(self, file_path: str) -> str:
             except (OSError, AttributeError) as e:
                 self.logger.debug(f"Failed to load LibRaw from {lib_name}: {e}")
         
+        # Try to find in common directories
+        common_dirs = []
+        if current_platform == "Windows":
+            common_dirs.extend([
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bin"),
+                os.path.dirname(os.path.abspath(__file__))
+            ])
+        elif current_platform == "Darwin":  # macOS
+            common_dirs.extend([
+                "/usr/local/lib",
+                "/opt/homebrew/lib"
+            ])
+        else:  # Linux
+            common_dirs.extend([
+                "/usr/lib",
+                "/usr/local/lib",
+                "/usr/lib64",
+                "/usr/local/lib64"
+            ])
+        
+        # Check common directories
+        for directory in common_dirs:
+            if not os.path.exists(directory):
+                continue
+                
+            for lib_name in self.lib_paths[current_platform]:
+                lib_path = os.path.join(directory, os.path.basename(lib_name))
+                if os.path.exists(lib_path):
+                    try:
+                        self.libraw = ctypes.cdll.LoadLibrary(lib_path)
+                        self.logger.info(f"Loaded LibRaw from: {lib_path}")
+                        return self._initialize_functions()
+                    except (OSError, AttributeError) as e:
+                        self.logger.debug(f"Failed to load LibRaw from {lib_path}: {e}")
+        
         self.logger.error("Failed to load LibRaw library. Please install LibRaw or specify a valid path.")
         return False
+
+    def get_manufacturer_from_extension(self, file_path: str) -> str:
+        """Get manufacturer from file extension."""
+        ext = os.path.splitext(file_path)[1].lower().lstrip('.')
+        for manufacturer, extensions in {
+            'Canon': ['cr2', 'cr3', 'crw'],
+            'Nikon': ['nef', 'nrw'],
+            'Sony': ['arw', 'srf', 'sr2'],
+            'Fujifilm': ['raf'],
+            'Olympus': ['orf'],
+            'Panasonic': ['rw2'],
+            'Pentax': ['pef', 'dng'],
+            'Leica': ['raw', 'rwl', 'dng'],
+            'Hasselblad': ['3fr', 'fff'],
+            'Phase One': ['iiq'],
+            'Sigma': ['x3f']
+        }.items():
+            if ext in extensions:
+                return manufacturer
+        return "Unknown"
     
     def _initialize_functions(self) -> bool:
         """
