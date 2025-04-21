@@ -4,16 +4,15 @@ channels:
   - defaults
 dependencies:
   - python=3.10
-  - numpy
   - pillow
   - opencv
-  - tensorflow
   - scikit-image
   - scikit-learn
   - tqdm
   - psutil
   - pip
   - pip:
+    - tensorflow==2.12.0
     - rawpy>=0.17.0
     - exifread>=2.3.2
     - imagehash>=4.2.0
