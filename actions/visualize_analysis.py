@@ -14,7 +14,7 @@ def run(params: Dict[str, Any]) -> Dict[str, Any]:
     Parameters:
         --image <path>      Path to the image to analyze (required)
         --output <path>     Path to save the analysis report (optional)
-        --profile <name>    Rating profile to use (default: default)
+        --profile <n>       Rating profile to use (default: default)
         --use-gpu           Enable GPU acceleration if available
         --no-gpu            Force CPU fallback
 

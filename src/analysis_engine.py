@@ -609,6 +609,7 @@ class AnalysisEngine:
     def _calculate_contrast_improved(self, grayscale: np.ndarray) -> float:
         """
         Calculate image contrast using histogram analysis and local contrast.
+        Fixed to handle cases where filtered magnitude array may be empty.
         """
         # Global contrast: analyze histogram
         hist = cv2.calcHist([grayscale], [0], None, [256], [0, 256])
@@ -640,18 +641,19 @@ class AnalysisEngine:
         # Calculate mean gradient magnitude, excluding very low values
         # to avoid counting flat areas - with check for empty arrays
         filtered_magnitude = sobel_magnitude[sobel_magnitude > 10]
+        
+        # Check if filtered array is not empty before calculating mean
         if filtered_magnitude.size > 0:
             local_contrast = np.mean(filtered_magnitude)
         else:
-            # For placeholder images or very flat images, use a reasonable default
-            # or calculate mean of all gradients
-            local_contrast = np.mean(sobel_magnitude) * 2  # Scale up a bit
+            # If array is empty, calculate mean of all values
+            local_contrast = np.mean(sobel_magnitude) * 2  # Scale up to compensate for filter
         
         # Combine global and local contrast
         # Normalize scores to 0-100
         global_score = min(100, dynamic_range / 180 * 100)
         
-        # Avoid division by zero by adding a small epsilon
+        # Avoid division by zero
         if np.isnan(local_contrast) or local_contrast < 1e-6:
             local_score = 0
         else:
